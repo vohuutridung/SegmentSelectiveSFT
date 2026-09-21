@@ -4,6 +4,7 @@ artifacts/
 logs/
 data/aime25/
 data/amc12/
+data/s1k/train.jsonl
 data/limo/train.jsonl
 Attribution/processed_data/
 Eval/outputs_*/

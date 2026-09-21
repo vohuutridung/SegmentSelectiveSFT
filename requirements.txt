@@ -112,7 +112,8 @@ opentelemetry-proto==1.26.0
 opentelemetry-sdk==1.26.0
 opentelemetry-semantic-conventions==0.47b0
 opentelemetry-semantic-conventions-ai==0.4.11
-outlines==0.1.11
+# vLLM uses outlines_core directly. outlines==0.1.11 pins an incompatible
+# outlines_core version and makes a fresh online pip install unsatisfiable.
 outlines_core==0.2.10
 packaging==25.0
 pandas==2.3.1

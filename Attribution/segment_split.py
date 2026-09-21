@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument("--input-data", default=os.path.join(ROOT, "data/limo/train.jsonl"))
     parser.add_argument("--output-data", default=os.path.join(ROOT, "data/limo/solution_segments.jsonl"))
     parser.add_argument("--tokenizer", default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
-    parser.add_argument("--segment-mode", choices=SEGMENT_MODES, default="cue")
+    parser.add_argument("--segment-mode", choices=SEGMENT_MODES, default="paragraph")
     return parser.parse_args()
 
 

@@ -12,7 +12,7 @@ CUE_PATTERN = re.compile(
 SEGMENT_MODES = ("cue", "paragraph")
 
 
-def split_segments(text: str, mode: str = "cue") -> list[str]:
+def split_segments(text: str, mode: str = "paragraph") -> list[str]:
     """Split *text* without losing delimiters or changing its contents."""
     if mode not in SEGMENT_MODES:
         raise ValueError(f"Unknown segment mode: {mode}")
@@ -30,4 +30,3 @@ def split_segments(text: str, mode: str = "cue") -> list[str]:
     if "".join(segments) != text:
         raise RuntimeError("Segment split changed the source text")
     return segments
-

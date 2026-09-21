@@ -57,7 +57,24 @@ def main():
     if missing:
         raise SystemExit("Missing benchmark results: " + ", ".join(missing))
 
-    accs = [row["acc"] for row in rows if isinstance(row["acc"], (int, float))]
+    missing_metrics = [
+        row["task"]
+        for row in rows
+        if not all(
+            isinstance(row["pass_at_k"].get(key), (int, float))
+            for key in ("pass@1", "pass@3")
+        )
+    ]
+    if missing_metrics:
+        raise SystemExit(
+            "Missing pass@1/pass@3 metrics for: " + ", ".join(missing_metrics)
+        )
+
+    pass1s = [
+        row["pass_at_k"].get("pass@1")
+        for row in rows
+        if isinstance(row["pass_at_k"].get("pass@1"), (int, float))
+    ]
     pass_keys = sorted(
         {key for row in rows for key in row["pass_at_k"]},
         key=lambda key: int(key.split("@", 1)[1]),
@@ -73,7 +90,7 @@ def main():
             macro_pass_at_k[key] = round(sum(values) / len(values), 2)
     summary = {
         "metric": "pass@1 averaged over all generated completions",
-        "macro_average": round(sum(accs) / len(accs), 2) if accs else None,
+        "macro_average": round(sum(pass1s) / len(pass1s), 2) if pass1s else None,
         "macro_pass_at_k": macro_pass_at_k,
         "results": rows,
     }
@@ -83,20 +100,22 @@ def main():
         json.dump(summary, handle, indent=2, ensure_ascii=False)
 
     print(
-        f"{'benchmark':12s} {'pass@1':>8s} {'pass@6':>8s} "
+        f"{'benchmark':12s} {'pass@1':>8s} {'pass@3':>8s} "
         f"{'first':>8s} {'#q':>6s} {'#gen':>8s}"
     )
     for row in rows:
-        pass6 = row["pass_at_k"].get("pass@6")
-        pass6_text = f"{pass6:8.2f}" if isinstance(pass6, (int, float)) else f"{'-':>8s}"
+        pass1 = row["pass_at_k"].get("pass@1")
+        pass3 = row["pass_at_k"].get("pass@3")
+        pass1_text = f"{pass1:8.2f}" if isinstance(pass1, (int, float)) else f"{'-':>8s}"
+        pass3_text = f"{pass3:8.2f}" if isinstance(pass3, (int, float)) else f"{'-':>8s}"
         print(
-            f"{row['task']:12s} {row['acc']:8.2f} {pass6_text} "
+            f"{row['task']:12s} {pass1_text} {pass3_text} "
             f"{row['acc_first']:8.2f} "
             f"{row['num_questions']:6d} {row['num_scores']:8d}"
         )
-    macro6 = macro_pass_at_k.get("pass@6")
-    macro6_text = f"{macro6:8.2f}" if isinstance(macro6, (int, float)) else f"{'-':>8s}"
-    print(f"{'MACRO AVG':12s} {summary['macro_average']:8.2f} {macro6_text}")
+    macro3 = macro_pass_at_k.get("pass@3")
+    macro3_text = f"{macro3:8.2f}" if isinstance(macro3, (int, float)) else f"{'-':>8s}"
+    print(f"{'MACRO AVG':12s} {summary['macro_average']:8.2f} {macro3_text}")
     print(f"Summary: {output}")
 
 

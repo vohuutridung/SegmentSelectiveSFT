@@ -9,13 +9,14 @@ export TOKENIZERS_PARALLELISM=false
 
 MODEL_PATH="${MODEL_PATH:-${1:-Qwen/Qwen3-8B}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_qwen3_8b_selective}"
-RUN_TAG="${RUN_TAG:-qwen3_8b_selective}"
-TASK_SPECS="${TASK_SPECS:-aime24:32 aime25:32 amc12:32 math500:6}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_fullsft_r16_ep3}"
+RUN_TAG="${RUN_TAG:-fullsft_r16_ep3}"
+TASK_SPECS="${TASK_SPECS:-aime24:3 aime25:3 amc12:3 math500:3}"
 SEED="${SEED:-0}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
-TOP_P="${TOP_P:-1.0}"
+TOP_P="${TOP_P:-0.9}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
 TOP_K="${TOP_K:--1}"
 MIN_P="${MIN_P:-0}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
@@ -44,6 +45,7 @@ for spec in $TASK_SPECS; do
     --temperature "$TEMPERATURE" \
     --n_sampling "$samples" \
     --top_p "$TOP_P" \
+    --repetition_penalty "$REPETITION_PENALTY" \
     --top_k "$TOP_K" \
     --min_p "$MIN_P" \
     --pipeline_parallel_size "$PIPELINE_PARALLEL_SIZE" \
@@ -52,7 +54,6 @@ for spec in $TASK_SPECS; do
     --save_outputs \
     --apply_chat_template \
     --enable-thinking \
-    --prefill-think \
     --enable_prefix_caching)
   if [[ "$MAX_MODEL_LEN" != "0" ]]; then
     eval_command+=(--max_model_len "$MAX_MODEL_LEN")

@@ -1,157 +1,131 @@
-# Segment-Level Attribution for Selective Learning of Long Reasoning Traces
+# SegmentSelectiveSFT — online Qwen3-8B baseline
 
-Implementation of the ICLR 2026 paper by Siyuan Wang, Yanchen Liu, and Xiang
-Ren, adapted for an ordinary Internet-connected NVIDIA server.
+This branch ports the experiment in
+`new_nothingnew_2/SegmentSelectiveSFT` from an offline, machine-specific server
+to an ordinary Internet-connected NVIDIA server. Models and datasets are loaded
+from Hugging Face, and there are no `/mnt/local` or `aiskylimit` paths.
 
-This branch keeps the paper pipeline—LIMO, cue segmentation, 50-step
-Integrated Gradients, strength/consistency selection, full-CoT SFT followed by
-selective SFT—but uses the requested `Qwen/Qwen3-8B` train/eval backbone.
-`deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` remains the attribution model, as in
-the paper. Qwen3-8B is a new backbone experiment, so its scores are not expected
-to reproduce the paper's Qwen2.5-7B table.
+The comparison recipe—not the paper appendix—is authoritative here. The only
+intentional experiment change is the requested backbone:
+`Qwen/Qwen2.5-7B-Instruct` becomes `Qwen/Qwen3-8B`.
 
-## One-command workflow
+## Run end to end
 
 Requirements:
 
-- Linux, Python 3.11, NVIDIA driver/CUDA-compatible GPUs.
-- Enough disk for two model snapshots, two full Qwen3-8B training stages, and
-  vLLM caches.
-- A GPU large enough for full-parameter 8B training at sequence length 16,384.
-  The training launcher is single-process and intentionally follows the paper's
-  full-parameter setup; set `GPU_TRAIN` to exactly one sufficiently large GPU.
-- Internet access to Hugging Face. Set `HF_TOKEN` when your environment or
-  mirror requires authentication.
-
-Run everything:
+- Linux and Python 3.11.
+- One sufficiently large NVIDIA GPU for training. The reference experiment is
+  single-process and uses sequence length 32,768.
+- Enough CPU RAM and disk to merge and store an 8B model.
+- Hugging Face access; set `HF_TOKEN` if required.
 
 ```bash
 bash project_commands.sh all
 ```
 
-This creates two isolated virtual environments, downloads models and datasets,
-runs attribution, trains Qwen3-8B in two stages, then evaluates on AIME24,
-AIME25, AMC12, and MATH500.
-
-Long jobs can be scheduled independently:
+The stages can also be scheduled separately:
 
 ```bash
 bash project_commands.sh setup
 bash project_commands.sh download data
-bash project_commands.sh attribution
-bash project_commands.sh full-sft
-bash project_commands.sh selective-sft
+bash project_commands.sh train
+bash project_commands.sh merge
 bash project_commands.sh eval
 ```
 
-`bash project_commands.sh config` prints the resolved configuration without
-starting a job. `DRY_RUN=1 bash project_commands.sh all` prints every command.
+Use `DRY_RUN=1 bash project_commands.sh all` to print the complete workflow,
+or `bash project_commands.sh config` to print resolved settings.
 
-## Defaults and overrides
+## Fair-comparison configuration
 
-The defaults are:
+These defaults mirror `new_nothingnew_2/SegmentSelectiveSFT/commands.sh`:
 
 | Component | Default |
 |---|---|
-| Training data | `GAIR/LIMO`, 817 examples |
-| Attribution model | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` |
+| Training data | `baesad/s1K-1.1-deepseek-cot`, 934 rows |
 | Backbone | `Qwen/Qwen3-8B` |
-| Segmentation | transition cues |
-| IG integration | 50 points, alpha = 1/50 ... 1 |
-| Selection | top 70% attribution strength, consistency <= 0.8 |
-| Stage 1 | full-CoT, 7 epochs, LR 1.5e-5 |
-| Stage 2 | selective SFT, 4 epochs, LR 8e-6 |
-| Context | 16,384 tokens |
-| Eval decoding | paper sampling: Qwen3 thinking, temp 0.6, top-p 1.0 |
+| Training strategy | one-stage full-CoT SFT; no segment mask |
+| Parameter-efficient tuning | LoRA |
+| LoRA | r=16, alpha=16, dropout=0.05 |
+| Target modules | q/k/v/o and gate/up/down projections |
+| Epochs | 3 |
+| Learning rate | 5e-5 |
+| Sequence length | 32,768 |
+| Batch | 1 per device × 32 gradient accumulation |
+| Optimizer | `adamw_torch`, betas=(0.9, 0.999), eps=1e-8 |
+| Weight decay | 0.0 |
+| Scheduler | cosine, warmup ratio 0.1 |
+| Gradient checkpointing | Unsloth checkpointing enabled |
+| Seed | 3407 |
+| Eval samples | 3 per question for every benchmark |
+| Eval decoding | temperature 0.6, top-p 0.9, repetition penalty 1.05 |
+| Max generated tokens | 32,768 |
+| Reported metrics | pass@1 and pass@3, plus first-sample accuracy |
 
-Useful overrides:
+The training prompt and raw s1K response are unchanged. As in the comparison
+repository's `think_prefix=none` setting, no `<think>` token is manually
+prefilled. The Qwen3 chat template is still used with its native thinking mode.
+
+Environment variables override any setting without editing the script. For
+example:
 
 ```bash
-GPU_ATTR=0,1 GPU_TRAIN=2 GPU_EVAL=0,1 bash project_commands.sh all
+HF_HOME=/mnt/cache/huggingface GPU_TRAIN=1 GPU_EVAL=0 \
+  bash project_commands.sh all
 
-HF_HOME=/mnt/cache/huggingface \
-ARTIFACT_DIR=/mnt/checkpoints/segment-sft \
-bash project_commands.sh all
-
-# Cheaper validation run before the full evaluation (use a distinct tag).
-EVAL_TAG=smoke AIME_N=2 AMC_N=2 MATH_N=2 MAX_TOKENS=4096 \
-bash project_commands.sh eval
-
-# Evaluate another HF model or local checkpoint with the same harness.
-EVAL_MODEL=Qwen/Qwen3-8B EVAL_TAG=qwen3_base bash project_commands.sh eval
+EVAL_N=1 MAX_TOKENS=4096 EVAL_TAG=smoke \
+  EVAL_MODEL=Qwen/Qwen3-8B bash project_commands.sh eval
 ```
 
-All options are environment variables so the committed script stays portable;
-there are no `/mnt/local`, `aiskylimit`, or machine-specific model paths.
-Attribution checkpoints each completed example and resumes by default; use
-`ATTR_RESUME=0` to recompute it from the beginning.
-
-## Data and outputs
+## Data and model flow
 
 `prepare_hf_data.py` downloads and converts:
 
-- `GAIR/LIMO`
+- `baesad/s1K-1.1-deepseek-cot`
 - `math-ai/aime24`
 - `math-ai/aime25`
-- `AI-MO/aimo-validation-amc` (83 modified AMC12 2022/2023 problems)
+- `AI-MO/aimo-validation-amc` as `amc12`
 - `HuggingFaceH4/MATH-500`
 
-Generated artifacts are ignored by Git:
+Training writes the LoRA adapter to:
 
 ```text
-artifacts/
-├── attribution/
-├── data/solutions_top70_consistency80_7B_J50.jsonl
-├── qwen3_8b_fullcot/final/
-└── qwen3_8b_selective/final/
-
-Eval/outputs_qwen3_8b_selective/
-└── summary.json
+artifacts/qwen3_8b_fullsft_lora_r16/final/
 ```
 
-The final evaluation prints a table and writes
-`Eval/outputs_qwen3_8b_selective/summary.json`. `acc` is pass@1 averaged over
-all generated completions; the summary also reports the unbiased pass@6
-estimator used by the paper. `acc_first` is retained for comparison with the
-original evaluator, which only reported completion zero.
+Because vLLM evaluates a complete model, the next stage merges that adapter
+with Qwen3-8B:
 
-## Method notes
-
-For every LIMO reasoning trace, the pipeline:
-
-1. Splits the trace at the paper's transition cues without deleting or changing
-   any characters.
-2. Uses the padding embedding as the IG baseline and estimates the path integral
-   at `j / 50`, for `j = 1 ... 50`, against the log-probability of the correct
-   final-answer tokens.
-3. Computes segment strength as `sum(abs(IG)) / sqrt(token_count)` and direction
-   consistency as `abs(sum(IG)) / sum(abs(IG))`.
-4. Takes the smallest set of highest-strength segments whose cumulative strength
-   reaches 70%, removes candidates with consistency above 0.8, then adds the
-   first and last segments as required by the appendix.
-5. Runs full-CoT SFT and continues from that checkpoint with loss enabled only
-   on the selected segments.
-
-The full reasoning trace remains in the input. Selective SFT masks labels with
-`-100` outside selected segments; it is selective supervision, not trace
-pruning. Following the paper appendix, the first and last segments are always
-supervised in addition to the IG-selected segments.
-
-Qwen3 already contains `<think>` and `</think>` tokens. Training and evaluation
-therefore use the native thinking chat template and the same `<think>` prefill;
-the vocabulary is not resized. The unchanged LIMO trace is placed inside that
-thinking block, and training also supervises the closing `</think>` and
-`<|im_end|>` format tokens so generation can terminate normally.
-
-## Citation
-
-Paper: [arXiv:2602.00425](https://arxiv.org/abs/2602.00425)
-
-```bibtex
-@inproceedings{wang2026segment,
-  title     = {Segment-Level Attribution for Selective Learning of Long Reasoning Traces},
-  author    = {Wang, Siyuan and Liu, Yanchen and Ren, Xiang},
-  booktitle = {International Conference on Learning Representations (ICLR)},
-  year      = {2026}
-}
+```text
+artifacts/qwen3_8b_fullsft_lora_r16/final-merged/
 ```
+
+Evaluation writes per-question generations, per-task metrics, and the final
+summary to:
+
+```text
+Eval/outputs_fullsft_r16_ep3/summary.json
+```
+
+Existing task metrics are reused by default, matching the resumable behavior of
+the comparison repository. Set `EVAL_OVERWRITE=1` to regenerate them.
+
+## Optional selective pipeline
+
+The default `all` workflow is deliberately the full-CoT baseline above. The
+original attribution/selective code remains available for separate experiments:
+
+```bash
+bash project_commands.sh attribution
+```
+
+Its defaults also follow the comparison folder: s1K data, paragraph
+segmentation, 20 IG integration points, IG batch size 4, and no automatic
+resume. It is not executed by the fair-comparison baseline.
+
+## Paper
+
+The underlying code implements *Segment-Level Attribution for Selective
+Learning of Long Reasoning Traces* ([arXiv:2602.00425](https://arxiv.org/abs/2602.00425)).
+This branch intentionally uses the separate experimental recipe documented
+above rather than the paper's default training schedule.

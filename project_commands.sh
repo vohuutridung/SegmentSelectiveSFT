@@ -1,16 +1,6 @@
 #!/usr/bin/env bash
-# Online end-to-end runner for Segment-Selective SFT with Qwen3-8B.
-#
-# Usage:
-#   bash project_commands.sh setup
-#   bash project_commands.sh data download attribution train eval
-#   bash project_commands.sh all
-#
-# Common overrides:
-#   GPU_ATTR=0,1 GPU_TRAIN=0 GPU_EVAL=0,1 bash project_commands.sh all
-#   HF_HOME=/mnt/cache/huggingface bash project_commands.sh download data
-#   AIME_N=8 AMC_N=8 MATH_N=4 bash project_commands.sh eval
-#   EVAL_MODEL=/path/to/another/model bash project_commands.sh eval
+# Online end-to-end runner matching new_nothingnew_2/SegmentSelectiveSFT.
+# Only infrastructure paths and the requested Qwen3-8B backbone differ.
 
 set -Eeuo pipefail
 
@@ -28,43 +18,56 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
 export TOKENIZERS_PARALLELISM=false
 
-ATTR_MODEL="${ATTR_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 BACKBONE_MODEL="${BACKBONE_MODEL:-Qwen/Qwen3-8B}"
-GPU_ATTR="${GPU_ATTR:-0,1}"
+ATTR_MODEL="${ATTR_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 GPU_TRAIN="${GPU_TRAIN:-0}"
 GPU_EVAL="${GPU_EVAL:-0}"
+GPU_ATTR="${GPU_ATTR:-0,1}"
 
-IG_STEPS="${IG_STEPS:-50}"
-IG_BATCH_SIZE="${IG_BATCH_SIZE:-1}"
-ATTR_RESUME="${ATTR_RESUME:-1}"
-SEGMENT_MODE="${SEGMENT_MODE:-cue}"
-MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-16384}"
+# Fair-comparison recipe from new_nothingnew_2/SegmentSelectiveSFT/commands.sh.
+EPOCHS="${EPOCHS:-3}"
+LEARNING_RATE="${LEARNING_RATE:-5e-5}"
+MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-32768}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
+GRAD_ACCUM="${GRAD_ACCUM:-32}"
+OPTIM="${OPTIM:-adamw_torch}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+ADAM_BETA1="${ADAM_BETA1:-0.9}"
+ADAM_BETA2="${ADAM_BETA2:-0.999}"
+ADAM_EPSILON="${ADAM_EPSILON:-1e-8}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.1}"
+LORA_R="${LORA_R:-16}"
+LORA_ALPHA="${LORA_ALPHA:-16}"
+LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
 
-# Qwen schedule from the paper, applied to the requested Qwen3-8B backbone.
-FULL_EPOCHS="${FULL_EPOCHS:-7}"
-FULL_LR="${FULL_LR:-1.5e-5}"
-SELECTIVE_EPOCHS="${SELECTIVE_EPOCHS:-4}"
-SELECTIVE_LR="${SELECTIVE_LR:-8e-6}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-2}"
-GRAD_ACCUM="${GRAD_ACCUM:-1}"
+# Optional selective-SFT preparation uses the same comparison-repo defaults.
+SEGMENT_MODE="${SEGMENT_MODE:-paragraph}"
+IG_STEPS="${IG_STEPS:-20}"
+IG_BATCH_SIZE="${IG_BATCH_SIZE:-4}"
+ATTR_RESUME="${ATTR_RESUME:-0}"
 
-AIME_N="${AIME_N:-32}"
-AMC_N="${AMC_N:-32}"
-MATH_N="${MATH_N:-6}"
+EVAL_N="${EVAL_N:-3}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
-EVAL_TAG="${EVAL_TAG:-qwen3_8b_selective}"
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TOP_P="${TOP_P:-0.9}"
+REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
+EVAL_TAG="${EVAL_TAG:-fullsft_r16_ep3}"
+EVAL_OVERWRITE="${EVAL_OVERWRITE:-0}"
+DATA_OVERWRITE="${DATA_OVERWRITE:-0}"
 
 ARTIFACT_DIR="${ARTIFACT_DIR:-${ROOT_DIR}/artifacts}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/logs}"
-SEGMENT_FILE="${ARTIFACT_DIR}/attribution/solution_segments.jsonl"
-ATTRIBUTED_FILE="${ARTIFACT_DIR}/attribution/solution_segments_attributed_7B_J${IG_STEPS}.jsonl"
-IG_FILE="${ARTIFACT_DIR}/attribution/IG_7B_J${IG_STEPS}.jsonl"
-SELECTED_DATA="${ARTIFACT_DIR}/data/solutions_top70_consistency80_7B_J${IG_STEPS}.jsonl"
-FULL_OUTPUT="${ARTIFACT_DIR}/qwen3_8b_fullcot"
-SELECTIVE_OUTPUT="${ARTIFACT_DIR}/qwen3_8b_selective"
-FULL_MODEL="${FULL_OUTPUT}/final"
-SELECTIVE_MODEL="${SELECTIVE_OUTPUT}/final"
-EVAL_MODEL="${EVAL_MODEL:-${SELECTIVE_MODEL}}"
+TRAIN_DATA="${ROOT_DIR}/data/s1k/train.jsonl"
+SEGMENT_FILE="${ARTIFACT_DIR}/attribution/s1k_solution_segments.jsonl"
+ATTRIBUTED_FILE="${ARTIFACT_DIR}/attribution/s1k_attributed_J${IG_STEPS}.jsonl"
+IG_FILE="${ARTIFACT_DIR}/attribution/s1k_IG_J${IG_STEPS}.jsonl"
+SELECTED_DATA="${ARTIFACT_DIR}/data/s1k_solutions_selected.jsonl"
+TRAIN_OUTPUT="${ARTIFACT_DIR}/qwen3_8b_fullsft_lora_r${LORA_R}"
+ADAPTER_MODEL="${TRAIN_OUTPUT}/final"
+MERGED_MODEL="${TRAIN_OUTPUT}/final-merged"
+EVAL_MODEL="${EVAL_MODEL:-${MERGED_MODEL}}"
 EVAL_OUTPUT="${EVAL_OUTPUT:-${ROOT_DIR}/Eval/outputs_${EVAL_TAG}}"
 
 DRY_RUN="${DRY_RUN:-0}"
@@ -103,35 +106,32 @@ require_file() {
 require_model() {
   case "$1" in
     /*|./*|../*) require_file "$1" ;;
-    *) : ;; # A Hugging Face repository ID is resolved online by Transformers/vLLM.
+    *) : ;;
   esac
 }
 
 stage_setup() {
-  log "Creating two isolated Python environments"
-  command -v "$PYTHON_BIN" >/dev/null 2>&1 || die "Cannot find ${PYTHON_BIN}; install Python 3.11 or set PYTHON_BIN"
+  log "Creating isolated train and eval environments"
+  command -v "$PYTHON_BIN" >/dev/null 2>&1 || die \
+    "Cannot find ${PYTHON_BIN}; install Python 3.11 or set PYTHON_BIN"
 
-  if [[ ! -x "$EVAL_PY" ]]; then
-    run "$PYTHON_BIN" -m venv "$EVAL_VENV"
-  fi
-  if [[ ! -x "$TRAIN_PY" ]]; then
-    run "$PYTHON_BIN" -m venv "$TRAIN_VENV"
-  fi
+  [[ -x "$EVAL_PY" ]] || run "$PYTHON_BIN" -m venv "$EVAL_VENV"
+  [[ -x "$TRAIN_PY" ]] || run "$PYTHON_BIN" -m venv "$TRAIN_VENV"
 
-  if [[ "$DRY_RUN" == "1" || "$FORCE_SETUP" == "1" || ! -f "${EVAL_VENV}/.ssft_ready" ]]; then
+  if [[ "$DRY_RUN" == "1" || "$FORCE_SETUP" == "1" || ! -f "${EVAL_VENV}/.ssft_ready" || "${ROOT_DIR}/requirements.txt" -nt "${EVAL_VENV}/.ssft_ready" ]]; then
     run "${EVAL_VENV}/bin/pip" install --upgrade pip
     run "${EVAL_VENV}/bin/pip" install -r "${ROOT_DIR}/requirements.txt"
     run "${EVAL_VENV}/bin/pip" install -e "${ROOT_DIR}/Eval/latex2sympy"
     run "$EVAL_PY" -c "import torch, transformers, vllm, datasets; print(torch.__version__, transformers.__version__, vllm.__version__)"
     [[ "$DRY_RUN" == "1" ]] || touch "${EVAL_VENV}/.ssft_ready"
   else
-    log "Eval/attribution environment already prepared"
+    log "Eval environment already prepared"
   fi
 
-  if [[ "$DRY_RUN" == "1" || "$FORCE_SETUP" == "1" || ! -f "${TRAIN_VENV}/.ssft_ready" ]]; then
+  if [[ "$DRY_RUN" == "1" || "$FORCE_SETUP" == "1" || ! -f "${TRAIN_VENV}/.ssft_ready" || "${ROOT_DIR}/SelectiveSFT/requirements.txt" -nt "${TRAIN_VENV}/.ssft_ready" ]]; then
     run "${TRAIN_VENV}/bin/pip" install --upgrade pip
     run "${TRAIN_VENV}/bin/pip" install -r "${ROOT_DIR}/SelectiveSFT/requirements.txt"
-    run "$TRAIN_PY" -c "import torch, transformers, trl, unsloth, datasets; print(torch.__version__, transformers.__version__, trl.__version__)"
+    run "$TRAIN_PY" -c "import torch, transformers, trl, unsloth, torchao, bitsandbytes; print(torch.__version__, transformers.__version__, trl.__version__)"
     [[ "$DRY_RUN" == "1" ]] || touch "${TRAIN_VENV}/.ssft_ready"
   else
     log "Training environment already prepared"
@@ -140,27 +140,29 @@ stage_setup() {
 
 stage_download() {
   require_file "$EVAL_PY"
-  log "Downloading Hugging Face model snapshots"
-  run_logged download_models "$EVAL_PY" "${ROOT_DIR}/download_hf_models.py" \
-    "$ATTR_MODEL" "$BACKBONE_MODEL" --cache-dir "$HF_HUB_CACHE"
+  log "Downloading Qwen3-8B from Hugging Face"
+  run_logged download_model "$EVAL_PY" "${ROOT_DIR}/download_hf_models.py" \
+    "$BACKBONE_MODEL" --cache-dir "$HF_HUB_CACHE"
 }
 
 stage_data() {
   require_file "$EVAL_PY"
-  log "Downloading and converting LIMO + AIME24/AIME25/AMC12/MATH500"
-  run_logged prepare_data "$EVAL_PY" "${ROOT_DIR}/prepare_hf_data.py" \
-    --data-root "${ROOT_DIR}/data" \
-    --cache-dir "$HF_DATASETS_CACHE" \
-    --overwrite
+  log "Downloading s1K plus AIME24/AIME25/AMC12/MATH500"
+  local data_command=("$EVAL_PY" "${ROOT_DIR}/prepare_hf_data.py"
+    --tasks s1k aime24 aime25 amc12 math500
+    --data-root "${ROOT_DIR}/data"
+    --cache-dir "$HF_DATASETS_CACHE")
+  [[ "$DATA_OVERWRITE" == "1" ]] && data_command+=(--overwrite)
+  run_logged prepare_data "${data_command[@]}"
 }
 
 stage_attribution() {
   require_file "$EVAL_PY"
-  require_file "${ROOT_DIR}/data/limo/train.jsonl"
-  log "Cue segmentation + J=${IG_STEPS} Integrated Gradients"
+  require_file "$TRAIN_DATA"
+  log "Optional paragraph segmentation + J=${IG_STEPS} IG on s1K"
   run_logged segment env CUDA_VISIBLE_DEVICES="$GPU_ATTR" "$EVAL_PY" \
     "${ROOT_DIR}/Attribution/segment_split.py" \
-    --input-data "${ROOT_DIR}/data/limo/train.jsonl" \
+    --input-data "$TRAIN_DATA" \
     --output-data "$SEGMENT_FILE" \
     --tokenizer "$ATTR_MODEL" \
     --segment-mode "$SEGMENT_MODE"
@@ -173,9 +175,7 @@ stage_attribution() {
     --output_ig_file "$IG_FILE"
     --ig_steps "$IG_STEPS"
     --ig_batch_size "$IG_BATCH_SIZE")
-  if [[ "$ATTR_RESUME" == "1" ]]; then
-    attribution_command+=(--resume)
-  fi
+  [[ "$ATTR_RESUME" == "1" ]] && attribution_command+=(--resume)
   run_logged attribution "${attribution_command[@]}"
 
   run_logged select_segments "$EVAL_PY" \
@@ -187,52 +187,48 @@ stage_attribution() {
     --consistency_max 0.8
 }
 
-stage_full_sft() {
-  require_file "$TRAIN_PY"
-  require_file "${ROOT_DIR}/data/limo/train.jsonl"
-  [[ "$GPU_TRAIN" != *,* ]] || die \
-    "Training is single-process full-parameter SFT; set GPU_TRAIN to one sufficiently large GPU"
-  log "Stage 1/2: full-CoT SFT of Qwen3-8B"
-  run_logged train_full env CUDA_VISIBLE_DEVICES="$GPU_TRAIN" "$TRAIN_PY" \
-    "${ROOT_DIR}/SelectiveSFT/train_mask.py" \
-    --model_name_or_path "$BACKBONE_MODEL" \
-    --data_names "${ROOT_DIR}/data/limo/train.jsonl" \
-    --output_dir "$FULL_OUTPUT" \
-    --epochs "$FULL_EPOCHS" \
-    --learning_rate "$FULL_LR" \
-    --max_seq_length "$MAX_SEQ_LENGTH" \
-    --per_device_train_batch_size "$TRAIN_BATCH_SIZE" \
-    --gradient_accumulation_steps "$GRAD_ACCUM" \
-    --enable-thinking \
-    --prefill-think
-}
-
-stage_selective_sft() {
-  require_file "$TRAIN_PY"
-  require_file "$FULL_MODEL"
-  require_file "$SELECTED_DATA"
-  [[ "$GPU_TRAIN" != *,* ]] || die \
-    "Training is single-process full-parameter SFT; set GPU_TRAIN to one sufficiently large GPU"
-  log "Stage 2/2: segment-selective SFT from the full-CoT checkpoint"
-  run_logged train_selective env CUDA_VISIBLE_DEVICES="$GPU_TRAIN" "$TRAIN_PY" \
-    "${ROOT_DIR}/SelectiveSFT/train_mask.py" \
-    --model_name_or_path "$FULL_MODEL" \
-    --data_names "$SELECTED_DATA" \
-    --output_dir "$SELECTIVE_OUTPUT" \
-    --epochs "$SELECTIVE_EPOCHS" \
-    --learning_rate "$SELECTIVE_LR" \
-    --max_seq_length "$MAX_SEQ_LENGTH" \
-    --per_device_train_batch_size "$TRAIN_BATCH_SIZE" \
-    --gradient_accumulation_steps "$GRAD_ACCUM" \
-    --segment_mode "$SEGMENT_MODE" \
-    --mask \
-    --enable-thinking \
-    --prefill-think
-}
-
 stage_train() {
-  stage_full_sft
-  stage_selective_sft
+  require_file "$TRAIN_PY"
+  require_file "$TRAIN_DATA"
+  [[ "$GPU_TRAIN" != *,* ]] || die \
+    "The reference recipe trains one process on one GPU; set one GPU in GPU_TRAIN"
+  log "Full-CoT LoRA SFT: r=${LORA_R}, epochs=${EPOCHS}, effective batch=$((TRAIN_BATCH_SIZE * GRAD_ACCUM))"
+  local train_command=(env CUDA_VISIBLE_DEVICES="$GPU_TRAIN" "$TRAIN_PY"
+    "${ROOT_DIR}/SelectiveSFT/train_mask.py"
+    --model_name_or_path "$BACKBONE_MODEL"
+    --data_names "$TRAIN_DATA"
+    --output_dir "$TRAIN_OUTPUT"
+    --epochs "$EPOCHS"
+    --learning_rate "$LEARNING_RATE"
+    --max_seq_length "$MAX_SEQ_LENGTH"
+    --per_device_train_batch_size "$TRAIN_BATCH_SIZE"
+    --gradient_accumulation_steps "$GRAD_ACCUM"
+    --optim "$OPTIM"
+    --weight_decay "$WEIGHT_DECAY"
+    --adam_beta1 "$ADAM_BETA1"
+    --adam_beta2 "$ADAM_BETA2"
+    --adam_epsilon "$ADAM_EPSILON"
+    --lr_scheduler_type "$LR_SCHEDULER"
+    --warmup_ratio "$WARMUP_RATIO"
+    --lora_r "$LORA_R"
+    --lora_alpha "$LORA_ALPHA"
+    --lora_dropout "$LORA_DROPOUT"
+    --target_modules "$TARGET_MODULES"
+    --dataset_num_proc 2
+    --segment_mode "$SEGMENT_MODE"
+    --enable-thinking
+    --no-prefill-think)
+  run_logged train_fullsft "${train_command[@]}"
+}
+
+stage_merge() {
+  require_file "$TRAIN_PY"
+  require_file "${ADAPTER_MODEL}/adapter_config.json"
+  log "Merging LoRA adapter for vLLM"
+  run_logged merge_lora "$TRAIN_PY" "${ROOT_DIR}/SelectiveSFT/merge_lora.py" \
+    --adapter "$ADAPTER_MODEL" \
+    --base_model "$BACKBONE_MODEL" \
+    --output_dir "$MERGED_MODEL"
 }
 
 stage_eval() {
@@ -241,16 +237,19 @@ stage_eval() {
   for task in aime24 aime25 amc12 math500; do
     require_file "${ROOT_DIR}/data/${task}/test.jsonl"
   done
-  log "Evaluating ${EVAL_MODEL} on AIME24, AIME25, AMC12 and MATH500"
+  log "Evaluating ${EVAL_MODEL} with the fair-comparison decoding recipe"
   run_logged eval env \
     GPU_EVAL="$GPU_EVAL" \
     PYTHON_BIN="$EVAL_PY" \
     MODEL_PATH="$EVAL_MODEL" \
     OUTPUT_ROOT="$EVAL_OUTPUT" \
     RUN_TAG="$EVAL_TAG" \
-    TASK_SPECS="aime24:${AIME_N} aime25:${AIME_N} amc12:${AMC_N} math500:${MATH_N}" \
+    TASK_SPECS="aime24:${EVAL_N} aime25:${EVAL_N} amc12:${EVAL_N} math500:${EVAL_N}" \
     MAX_TOKENS="$MAX_TOKENS" \
-    OVERWRITE=1 \
+    TEMPERATURE="$TEMPERATURE" \
+    TOP_P="$TOP_P" \
+    REPETITION_PENALTY="$REPETITION_PENALTY" \
+    OVERWRITE="$EVAL_OVERWRITE" \
     bash "${ROOT_DIR}/Eval/run_eval.sh"
 
   run_logged summarize "$EVAL_PY" "${ROOT_DIR}/Eval/summarize_results.py" "$EVAL_OUTPUT"
@@ -258,26 +257,36 @@ stage_eval() {
 
 show_config() {
   cat <<EOF
-backbone model : $BACKBONE_MODEL
-attribution    : $ATTR_MODEL
-HF cache       : $HF_HOME
-GPUs attr/train/eval: $GPU_ATTR / $GPU_TRAIN / $GPU_EVAL
-IG             : mode=$SEGMENT_MODE steps=$IG_STEPS batch=$IG_BATCH_SIZE resume=$ATTR_RESUME
-train stage 1  : epochs=$FULL_EPOCHS lr=$FULL_LR
-train stage 2  : epochs=$SELECTIVE_EPOCHS lr=$SELECTIVE_LR
-sequence length: $MAX_SEQ_LENGTH
-eval samples   : AIME=$AIME_N AMC12=$AMC_N MATH500=$MATH_N
-final model    : $EVAL_MODEL
+backbone       : $BACKBONE_MODEL
+training data  : baesad/s1K-1.1-deepseek-cot -> $TRAIN_DATA
+training       : full-CoT LoRA r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT
+epochs / lr    : $EPOCHS / $LEARNING_RATE
+sequence       : $MAX_SEQ_LENGTH
+batch          : $TRAIN_BATCH_SIZE x $GRAD_ACCUM accumulation
+optimizer      : $OPTIM betas=($ADAM_BETA1,$ADAM_BETA2) eps=$ADAM_EPSILON wd=$WEIGHT_DECAY
+scheduler      : $LR_SCHEDULER warmup_ratio=$WARMUP_RATIO
+eval           : n=$EVAL_N temp=$TEMPERATURE top_p=$TOP_P repetition_penalty=$REPETITION_PENALTY
+adapter        : $ADAPTER_MODEL
+merged model   : $MERGED_MODEL
 eval output    : $EVAL_OUTPUT
+optional IG    : model=$ATTR_MODEL mode=$SEGMENT_MODE J=$IG_STEPS batch=$IG_BATCH_SIZE
 EOF
 }
 
 usage() {
-  sed -n '1,15p' "${BASH_SOURCE[0]}"
   cat <<'EOF'
+Usage: bash project_commands.sh <stage> [stage ...]
 
-Stages: setup download data attribution full-sft selective-sft train eval all config
-Run stages separately when scheduling attribution and training on different machines.
+Stages:
+  setup        Create the train/eval environments and install dependencies
+  download     Download Qwen3-8B from Hugging Face
+  data         Download s1K and the four evaluation datasets
+  train        Full-CoT LoRA SFT using the comparison-repo recipe
+  merge        Merge the final LoRA adapter for vLLM
+  eval         Evaluate AIME24, AIME25, AMC12 and MATH500
+  attribution  Optional paragraph/J20 attribution for selective experiments
+  all          setup, download, data, train, merge, eval
+  config       Print the resolved configuration
 EOF
 }
 
@@ -286,18 +295,17 @@ run_stage() {
     setup) stage_setup ;;
     download) stage_download ;;
     data) stage_data ;;
-    attribution) stage_attribution ;;
-    full-sft) stage_full_sft ;;
-    selective-sft) stage_selective_sft ;;
     train) stage_train ;;
+    merge) stage_merge ;;
     eval) stage_eval ;;
+    attribution) stage_attribution ;;
     config) show_config ;;
     all)
       stage_setup
       stage_download
       stage_data
-      stage_attribution
       stage_train
+      stage_merge
       stage_eval
       ;;
     help|-h|--help) usage ;;

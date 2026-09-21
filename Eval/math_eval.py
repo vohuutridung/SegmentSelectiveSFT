@@ -97,7 +97,8 @@ def prepare_data(data_name, args):
     # get out_file name
     dt_string = datetime.now().strftime("%m-%d_%H-%M")
     model_name = "/".join(args.model_name_or_path.split("/")[-2:])
-    out_file_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}_n{args.n_sampling}_topp{args.top_p}_len{args.max_tokens_per_call}_{model_name}"
+    rep_tag = "" if args.repetition_penalty == 1.0 else f"_rep{args.repetition_penalty}"
+    out_file_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}_n{args.n_sampling}_topp{args.top_p}{rep_tag}_len{args.max_tokens_per_call}_{model_name}"
     output_dir = args.output_dir
     out_file = f"{output_dir}/{out_file_prefix}_s{args.start}_e{args.end}.jsonl"
     os.makedirs(f"{output_dir}", exist_ok=True)
@@ -123,7 +124,8 @@ def setup(args):
     if not args.overwrite:
         for data_name in data_list:
             postfix = "/".join(args.model_name_or_path.split("/")[-2:])
-            out_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}_n{args.n_sampling}_topp{args.top_p}_len{args.max_tokens_per_call}_{postfix}"
+            rep_tag = "" if args.repetition_penalty == 1.0 else f"_rep{args.repetition_penalty}"
+            out_prefix = f"{args.split}_{args.prompt_type}_{args.num_test_sample}_seed{args.seed}_t{args.temperature}_n{args.n_sampling}_topp{args.top_p}{rep_tag}_len{args.max_tokens_per_call}_{postfix}"
             out_file =  f"{args.output_dir}/{out_prefix}_s{args.start}_e{args.end}.jsonl"
             out_metric_json = out_file.replace(".jsonl", f"_metrics.json")
             

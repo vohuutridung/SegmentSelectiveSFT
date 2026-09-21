@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download LIMO and evaluation benchmarks directly from Hugging Face.
+"""Download the experiment's s1K training set and eval data from Hugging Face.
 
 The generated JSONL files use the schema expected by the original paper code.
 All datasets can be overridden with CLI flags if a mirror is preferred.
@@ -13,6 +13,7 @@ import tempfile
 
 
 DEFAULT_DATASETS = {
+    "s1k": ("baesad/s1K-1.1-deepseek-cot", "train"),
     "limo": ("GAIR/LIMO", "train"),
     "aime24": ("math-ai/aime24", "test"),
     "aime25": ("math-ai/aime25", "test"),
@@ -21,6 +22,7 @@ DEFAULT_DATASETS = {
 }
 
 EXPECTED_ROWS = {
+    "s1k": 934,
     "limo": 817,
     "aime24": 30,
     "aime25": 30,
@@ -28,13 +30,15 @@ EXPECTED_ROWS = {
     "math500": 500,
 }
 
+DEFAULT_TASKS = ("s1k", "aime24", "aime25", "amc12", "math500")
+
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--tasks",
         nargs="+",
-        default=list(DEFAULT_DATASETS),
+        default=list(DEFAULT_TASKS),
         choices=list(DEFAULT_DATASETS),
         help="Datasets to download and convert",
     )
@@ -82,12 +86,12 @@ def first_present(row, keys):
 
 
 def convert_row(task, row, index):
-    if task == "limo":
+    if task in {"s1k", "limo"}:
         question = first_present(row, ("question", "problem"))
         solution = first_present(row, ("solution", "response"))
         answer = first_present(row, ("answer",)) or last_boxed(solution)
         if question is None or solution is None or answer is None:
-            raise ValueError(f"LIMO row {index} is missing question/solution/answer")
+            raise ValueError(f"{task} row {index} is missing question/solution/answer")
         return {
             "question": str(question).strip(),
             "solution": str(solution).strip(),
@@ -136,8 +140,8 @@ def main():
 
     for task in args.tasks:
         output = os.path.join(args.data_root, task, "test.jsonl")
-        if task == "limo":
-            output = os.path.join(args.data_root, "limo", "train.jsonl")
+        if task in {"s1k", "limo"}:
+            output = os.path.join(args.data_root, task, "train.jsonl")
         if os.path.exists(output) and not args.overwrite:
             print(f"{task:8s}: keeping existing {output} (use --overwrite to refresh)")
             continue
@@ -161,4 +165,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

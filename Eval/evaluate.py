@@ -92,9 +92,10 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
         "num_scores": len(scores),
         "timeout_samples": timeout_cnt,
         "empty_samples": len([s for s in samples if not s['pred'][-1]]),
-        # pass@1 over every generated completion; acc_first preserves the old metric.
-        "acc": round(100.0 * float(score_array.mean()), 2),
+        # Keep the comparison repo's legacy `acc`: completion zero only.
+        "acc": float(mean_score[0]),
         "acc_first": float(mean_score[0]),
+        "acc_all": round(100.0 * float(score_array.mean()), 2),
         "sample_acc": [float(value) for value in mean_score],
         "pass_at_k": pass_at_k,
     }

@@ -3,3 +3,5 @@ torch==2.9.0
 transformers==4.57.1
 trl==0.23.0
 unsloth==2025.11.3
+torchao<0.18
+bitsandbytes>=0.45.5,!=0.46.0,!=0.48.0
