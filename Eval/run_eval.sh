@@ -9,8 +9,8 @@ export TOKENIZERS_PARALLELISM=false
 
 MODEL_PATH="${MODEL_PATH:-${1:-Qwen/Qwen3-8B}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_fullsft_r16_ep3}"
-RUN_TAG="${RUN_TAG:-fullsft_r16_ep3}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_selective_r16_ep3}"
+RUN_TAG="${RUN_TAG:-selective_r16_ep3}"
 TASK_SPECS="${TASK_SPECS:-aime24:3 aime25:3 amc12:3 math500:3}"
 SEED="${SEED:-0}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
@@ -53,7 +53,7 @@ for spec in $TASK_SPECS; do
     --use_vllm \
     --save_outputs \
     --apply_chat_template \
-    --enable-thinking \
+    --no-enable-thinking \
     --enable_prefix_caching)
   if [[ "$MAX_MODEL_LEN" != "0" ]]; then
     eval_command+=(--max_model_len "$MAX_MODEL_LEN")

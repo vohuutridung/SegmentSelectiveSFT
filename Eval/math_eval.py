@@ -57,14 +57,8 @@ def parse_args():
     parser.add_argument(
         "--enable-thinking",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable the Qwen3 thinking chat template",
-    )
-    parser.add_argument(
-        "--prefill-think",
-        action=argparse.BooleanOptionalAction,
         default=False,
-        help="Append <think> to the assistant prefix (must match SFT)",
+        help="Qwen3 thinking mode; disabled to match the comparison prompt behavior",
     )
     parser.add_argument(
         "--adapt_few_shot",
@@ -314,8 +308,6 @@ def main(llm, tokenizer, data_name, args):
                     [{"role": "user", "content": prompt.strip()}],
                     **template_kwargs,
                 )
-                if args.prefill_think and not formatted.endswith("<think>\n"):
-                    formatted += "<think>\n"
                 formatted_prompts.append(formatted)
             input_prompts = formatted_prompts
 

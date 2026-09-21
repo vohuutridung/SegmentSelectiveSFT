@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LoRA full-CoT baseline or optional selective SFT for the experiment recipe."""
+"""Selective SFT (or optional full-CoT SFT) for the experiment recipe."""
 
 import argparse
 import gc
@@ -56,16 +56,16 @@ def parse_args():
     parser.add_argument("--mask", action="store_true", help="Use segment-selective labels")
     parser.add_argument("--segment_mode", choices=SEGMENT_MODES, default="paragraph")
     parser.add_argument(
-        "--enable-thinking",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Pass enable_thinking to the Qwen3 chat template",
+        "--think_prefix",
+        choices=("none", "plain"),
+        default="none",
+        help="Match the comparison folder: none adds no manual <think> prefix",
     )
     parser.add_argument(
-        "--prefill-think",
+        "--enable-thinking",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Optionally prefill <think>; the fair-comparison recipe leaves it off",
+        help="Qwen3 thinking mode; disabled to preserve the Qwen2.5 prompt behavior",
     )
     args = parser.parse_args()
     args.target_modules = [
@@ -183,13 +183,15 @@ def main():
                 "tokenize": False,
                 "add_generation_prompt": True,
             }
+            # The comparison folder uses Qwen2.5 with think_prefix=none, so its
+            # effective prompt has no thinking block. Disable Qwen3's otherwise
+            # enabled-by-default thinking mode to preserve that behavior.
             if is_qwen3:
                 chat_kwargs["enable_thinking"] = args.enable_thinking
             prompt_text = tokenizer.apply_chat_template(messages, **chat_kwargs)
-            think_prefix = "<think>\n" if args.prefill_think else ""
-            # Keep the reference experiment's exact strategy: append the raw
-            # s1K trace after the assistant prefix, without an added EOS or
-            # thinking suffix. The Qwen3 chat template itself remains native.
+            think_prefix = "<think>\n" if args.think_prefix == "plain" else ""
+            # Append the raw s1K trace after the native assistant prefix,
+            # without an added EOS or thinking suffix.
             full_text = prompt_text + think_prefix + output
             response_char = len(prompt_text) + len(think_prefix)
 

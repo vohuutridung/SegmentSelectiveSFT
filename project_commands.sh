@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Online end-to-end runner matching new_nothingnew_2/SegmentSelectiveSFT.
-# Only infrastructure paths and the requested Qwen3-8B backbone differ.
+# Online end-to-end selective-SFT runner matching
+# new_nothingnew_2/SegmentSelectiveSFT. Qwen3-8B is trained directly with the
+# selective mask; unlike the Qwen2.5 experiment, there is no full-CoT warm-up.
 
 set -Eeuo pipefail
 
@@ -22,7 +23,7 @@ BACKBONE_MODEL="${BACKBONE_MODEL:-Qwen/Qwen3-8B}"
 ATTR_MODEL="${ATTR_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-7B}"
 GPU_TRAIN="${GPU_TRAIN:-0}"
 GPU_EVAL="${GPU_EVAL:-0}"
-GPU_ATTR="${GPU_ATTR:-0,1}"
+GPU_ATTR="${GPU_ATTR:-0}"
 
 # Fair-comparison recipe from new_nothingnew_2/SegmentSelectiveSFT/commands.sh.
 EPOCHS="${EPOCHS:-3}"
@@ -42,7 +43,7 @@ LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 TARGET_MODULES="${TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
 
-# Optional selective-SFT preparation uses the same comparison-repo defaults.
+# Attribution and selection defaults from the comparison repository.
 SEGMENT_MODE="${SEGMENT_MODE:-paragraph}"
 IG_STEPS="${IG_STEPS:-20}"
 IG_BATCH_SIZE="${IG_BATCH_SIZE:-4}"
@@ -53,7 +54,7 @@ MAX_TOKENS="${MAX_TOKENS:-32768}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
 TOP_P="${TOP_P:-0.9}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.05}"
-EVAL_TAG="${EVAL_TAG:-fullsft_r16_ep3}"
+EVAL_TAG="${EVAL_TAG:-selective_r16_ep3}"
 EVAL_OVERWRITE="${EVAL_OVERWRITE:-0}"
 DATA_OVERWRITE="${DATA_OVERWRITE:-0}"
 
@@ -64,7 +65,7 @@ SEGMENT_FILE="${ARTIFACT_DIR}/attribution/s1k_solution_segments.jsonl"
 ATTRIBUTED_FILE="${ARTIFACT_DIR}/attribution/s1k_attributed_J${IG_STEPS}.jsonl"
 IG_FILE="${ARTIFACT_DIR}/attribution/s1k_IG_J${IG_STEPS}.jsonl"
 SELECTED_DATA="${ARTIFACT_DIR}/data/s1k_solutions_selected.jsonl"
-TRAIN_OUTPUT="${ARTIFACT_DIR}/qwen3_8b_fullsft_lora_r${LORA_R}"
+TRAIN_OUTPUT="${ARTIFACT_DIR}/qwen3_8b_selective_lora_r${LORA_R}"
 ADAPTER_MODEL="${TRAIN_OUTPUT}/final"
 MERGED_MODEL="${TRAIN_OUTPUT}/final-merged"
 EVAL_MODEL="${EVAL_MODEL:-${MERGED_MODEL}}"
@@ -140,9 +141,9 @@ stage_setup() {
 
 stage_download() {
   require_file "$EVAL_PY"
-  log "Downloading Qwen3-8B from Hugging Face"
-  run_logged download_model "$EVAL_PY" "${ROOT_DIR}/download_hf_models.py" \
-    "$BACKBONE_MODEL" --cache-dir "$HF_HUB_CACHE"
+  log "Downloading the Qwen3-8B backbone and attribution model from Hugging Face"
+  run_logged download_models "$EVAL_PY" "${ROOT_DIR}/download_hf_models.py" \
+    "$BACKBONE_MODEL" "$ATTR_MODEL" --cache-dir "$HF_HUB_CACHE"
 }
 
 stage_data() {
@@ -159,7 +160,7 @@ stage_data() {
 stage_attribution() {
   require_file "$EVAL_PY"
   require_file "$TRAIN_DATA"
-  log "Optional paragraph segmentation + J=${IG_STEPS} IG on s1K"
+  log "Paragraph segmentation + J=${IG_STEPS} IG and segment selection on s1K"
   run_logged segment env CUDA_VISIBLE_DEVICES="$GPU_ATTR" "$EVAL_PY" \
     "${ROOT_DIR}/Attribution/segment_split.py" \
     --input-data "$TRAIN_DATA" \
@@ -189,14 +190,14 @@ stage_attribution() {
 
 stage_train() {
   require_file "$TRAIN_PY"
-  require_file "$TRAIN_DATA"
+  require_file "$SELECTED_DATA"
   [[ "$GPU_TRAIN" != *,* ]] || die \
     "The reference recipe trains one process on one GPU; set one GPU in GPU_TRAIN"
-  log "Full-CoT LoRA SFT: r=${LORA_R}, epochs=${EPOCHS}, effective batch=$((TRAIN_BATCH_SIZE * GRAD_ACCUM))"
+  log "Selective LoRA SFT (no full-CoT warm-up): r=${LORA_R}, epochs=${EPOCHS}, effective batch=$((TRAIN_BATCH_SIZE * GRAD_ACCUM))"
   local train_command=(env CUDA_VISIBLE_DEVICES="$GPU_TRAIN" "$TRAIN_PY"
     "${ROOT_DIR}/SelectiveSFT/train_mask.py"
     --model_name_or_path "$BACKBONE_MODEL"
-    --data_names "$TRAIN_DATA"
+    --data_names "$SELECTED_DATA"
     --output_dir "$TRAIN_OUTPUT"
     --epochs "$EPOCHS"
     --learning_rate "$LEARNING_RATE"
@@ -216,9 +217,10 @@ stage_train() {
     --target_modules "$TARGET_MODULES"
     --dataset_num_proc 2
     --segment_mode "$SEGMENT_MODE"
-    --enable-thinking
-    --no-prefill-think)
-  run_logged train_fullsft "${train_command[@]}"
+    --think_prefix none
+    --no-enable-thinking
+    --mask)
+  run_logged train_selective "${train_command[@]}"
 }
 
 stage_merge() {
@@ -259,7 +261,9 @@ show_config() {
   cat <<EOF
 backbone       : $BACKBONE_MODEL
 training data  : baesad/s1K-1.1-deepseek-cot -> $TRAIN_DATA
-training       : full-CoT LoRA r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT
+training       : selective-only LoRA r=$LORA_R alpha=$LORA_ALPHA dropout=$LORA_DROPOUT
+warm-up        : none
+Qwen3 thinking : disabled (matches think_prefix=none behavior)
 epochs / lr    : $EPOCHS / $LEARNING_RATE
 sequence       : $MAX_SEQ_LENGTH
 batch          : $TRAIN_BATCH_SIZE x $GRAD_ACCUM accumulation
@@ -269,7 +273,7 @@ eval           : n=$EVAL_N temp=$TEMPERATURE top_p=$TOP_P repetition_penalty=$RE
 adapter        : $ADAPTER_MODEL
 merged model   : $MERGED_MODEL
 eval output    : $EVAL_OUTPUT
-optional IG    : model=$ATTR_MODEL mode=$SEGMENT_MODE J=$IG_STEPS batch=$IG_BATCH_SIZE
+attribution    : model=$ATTR_MODEL mode=$SEGMENT_MODE J=$IG_STEPS batch=$IG_BATCH_SIZE
 EOF
 }
 
@@ -279,13 +283,13 @@ Usage: bash project_commands.sh <stage> [stage ...]
 
 Stages:
   setup        Create the train/eval environments and install dependencies
-  download     Download Qwen3-8B from Hugging Face
+  download     Download Qwen3-8B and the attribution model from Hugging Face
   data         Download s1K and the four evaluation datasets
-  train        Full-CoT LoRA SFT using the comparison-repo recipe
+  train        Selective LoRA SFT directly from Qwen3-8B (no full-CoT warm-up)
   merge        Merge the final LoRA adapter for vLLM
   eval         Evaluate AIME24, AIME25, AMC12 and MATH500
-  attribution  Optional paragraph/J20 attribution for selective experiments
-  all          setup, download, data, train, merge, eval
+  attribution  Paragraph split, IG attribution and segment selection
+  all          setup, download, data, attribution, train, merge, eval
   config       Print the resolved configuration
 EOF
 }
@@ -304,6 +308,7 @@ run_stage() {
       stage_setup
       stage_download
       stage_data
+      stage_attribution
       stage_train
       stage_merge
       stage_eval
