@@ -1,4 +1,5 @@
 import argparse
+from math import comb
 import numpy as np
 from tqdm import tqdm
 from pebble import ProcessPool
@@ -13,10 +14,11 @@ from python_executor import PythonExecutor
 
 def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, max_num_samples=None, execute=False):
     assert samples or file_path, "samples or file_path must be provided"
-    print(samples[0])
-    # print(samples[1])
     if not samples:
         samples = list(load_jsonl(file_path))
+    if not samples:
+        raise ValueError("No evaluation samples were provided")
+    print(samples[0])
     if 'idx' in samples[0]:
         samples = {sample['idx']: sample for sample in samples}.values()
         samples = sorted(samples, key=lambda x: x['idx']) 
@@ -38,7 +40,7 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
     with ProcessPool(max_workers=1) as pool:
         future = pool.map(math_equal_process, params, timeout=3)
         iterator = future.result()
-        with tqdm(total=len(samples), desc="Evaluate") as progress_bar:
+        with tqdm(total=len(params), desc="Evaluate") as progress_bar:
             while True:
                 try:
                     result = next(iterator)
@@ -72,12 +74,29 @@ def evaluate(data_name, prompt_type, samples: list=None, file_path: str=None, ma
     col_means= np.array(score_mat).mean(axis=0)
     mean_score = list(np.round(col_means * 100, decimals=1))
 
+    score_array = np.asarray(score_mat, dtype=np.float64)
+
+    def estimate_pass_at_k(k):
+        values = []
+        n = score_array.shape[1]
+        for row in score_array:
+            correct = int(row.sum())
+            values.append(1.0 if n - correct < k else 1.0 - comb(n - correct, k) / comb(n, k))
+        return round(100.0 * float(np.mean(values)), 2)
+
+    requested_k = sorted({1, min(6, max_len), max_len})
+    pass_at_k = {f"pass@{k}": estimate_pass_at_k(k) for k in requested_k}
+
     result_json = {
         "num_samples": len(samples),
         "num_scores": len(scores),
         "timeout_samples": timeout_cnt,
         "empty_samples": len([s for s in samples if not s['pred'][-1]]),
-        "acc": mean_score[0]
+        # pass@1 over every generated completion; acc_first preserves the old metric.
+        "acc": round(100.0 * float(score_array.mean()), 2),
+        "acc_first": float(mean_score[0]),
+        "sample_acc": [float(value) for value in mean_score],
+        "pass_at_k": pass_at_k,
     }
 
     # each type score

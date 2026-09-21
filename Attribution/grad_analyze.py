@@ -3,8 +3,6 @@ import json
 import torch
 from tqdm import tqdm
 import argparse
-import math
-import numpy as np
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -19,8 +17,14 @@ class IntegratedGradientsAttribution:
       - We attribute the summed log-probability of answer tokens to input token embeddings.
       - The baseline is a sequence filled with `baseline_token_id` (often the pad token).
     """
-    def __init__(self, model_name):
+    def __init__(self, model_name, gradient_checkpointing=True):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if not self.tokenizer.is_fast:
+            raise SystemExit(
+                "A fast tokenizer is required for exact segment token offsets"
+            )
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         print("pad_token_id", self.tokenizer.pad_token_id)
 
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -30,54 +34,46 @@ class IntegratedGradientsAttribution:
             trust_remote_code=True
         )
         self.model.eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+        if gradient_checkpointing:
+            attention_dropout = getattr(self.model.config, "attention_dropout", 0.0) or 0.0
+            dropout_layers = [
+                module.p
+                for module in self.model.modules()
+                if isinstance(module, torch.nn.Dropout) and module.p > 0
+            ]
+            if attention_dropout > 0 or dropout_layers:
+                raise SystemExit(
+                    "Gradient checkpointing requires train mode, but this model has "
+                    "non-zero dropout. Re-run with --no-gradient-checkpointing."
+                )
+            self.model.config.use_cache = False
+            self.model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            # Hugging Face checkpointing is active only in train mode. Qwen's
+            # dropout is zero, so this does not change the IG function.
+            self.model.train()
+            print("gradient checkpointing: enabled")
+        else:
+            print("gradient checkpointing: disabled")
+        self.input_device = self.model.get_input_embeddings().weight.device
 
     @torch.no_grad()
     def _embed(self, input_ids):
-        return self.model.model.embed_tokens(input_ids)
+        return self.model.get_input_embeddings()(input_ids)
 
     def compute_step_to_answer_attribution_integrated(self, input_ids, step_indices, answer_indices, baseline_token_id=0, steps=50):
-        input_ids = torch.tensor(input_ids, dtype=torch.int32).unsqueeze(0).cuda()
-        
-        with torch.no_grad():
-            input_embeddings = self._embed(input_ids)  # [1, L, D]
-            baseline_embeddings = self._embed(torch.full_like(input_ids, baseline_token_id))      # [1, L, D]
-
-        # Interpolation path: baseline -> input
-        alphas = torch.linspace(0, 1, steps).view(-1, 1, 1, 1).to(torch.bfloat16).cuda()
-        total_gradients = torch.zeros_like(input_embeddings) # [1, L, D]
-
-        answer_token_ids = input_ids[0, answer_indices[0]:answer_indices[1]] # [A]
-        
-        for i in range(steps):
-            interpolated_embedding = (baseline_embeddings + alphas[i] * (input_embeddings - baseline_embeddings)).detach()
-            interpolated_embedding.requires_grad_(True)
-        
-            self.model.zero_grad()
-            output = self.model(inputs_embeds=interpolated_embedding)
-            logits = output.logits # [1, L, V]
-
-            target_logits = logits[0, answer_indices[0]-1:answer_indices[1]-1] # [A, V]
-            log_probs = torch.nn.functional.log_softmax(target_logits, dim=-1) # [A, V]
-            target_log_probs = log_probs[range(len(answer_token_ids)), answer_token_ids]
-
-            loss = target_log_probs.sum()
-            loss.backward()
-
-            total_gradients += interpolated_embedding.grad
-
-        avg_gradients = total_gradients / steps
-        input_diff = input_embeddings - baseline_embeddings  
-        attributions = (input_diff * avg_gradients).sum(dim=-1).squeeze()
-        attributions = attributions / attributions.norm()
-
-        step_scores = []
-        for step_idx in step_indices:
-            step_score = attributions[step_idx[0]: step_idx[1]]
-            step_scores.append(step_score.detach().cpu().float().tolist())
-
-        del output, total_gradients, input_embeddings, baseline_embeddings
-        torch.cuda.empty_cache()
-        return step_scores
+        return self.batch_compute_step_to_answer_attribution_integrated(
+            input_ids=input_ids,
+            step_indices=step_indices,
+            answer_indices=answer_indices,
+            baseline_token_id=baseline_token_id,
+            steps=steps,
+            batch_size=1,
+        )
         
 
     def batch_compute_step_to_answer_attribution_integrated(
@@ -90,13 +86,18 @@ class IntegratedGradientsAttribution:
         batch_size=1,   
     ):
         # [1, L]
-        input_ids = torch.tensor(input_ids, dtype=torch.int64).unsqueeze(0).cuda()
+        input_ids = torch.tensor(input_ids, dtype=torch.long, device=self.input_device).unsqueeze(0)
 
         with torch.no_grad():
             input_embeddings = self._embed(input_ids)  # [1, L, D]
             baseline_embeddings = self._embed(torch.full_like(input_ids, baseline_token_id))      # [1, L, D]
 
-        alphas = torch.linspace(0, 1, steps).view(steps, 1, 1).to(torch.bfloat16).cuda()
+        # Paper Eq. 2: alpha_j = j / J, j=1..J.
+        alphas = (
+            torch.arange(1, steps + 1, device=self.input_device, dtype=input_embeddings.dtype)
+            .div(steps)
+            .view(steps, 1, 1)
+        )
         total_gradients = torch.zeros_like(input_embeddings)  # [1, L, D]
 
         ans_start, ans_end = answer_indices
@@ -114,21 +115,29 @@ class IntegratedGradientsAttribution:
 
             # Interpolation path: baseline -> input
             interpolated_embeddings = baseline_expand + alphas_chunk * (input_expand - baseline_expand).detach()
-            interpolated_embeddings = interpolated_embeddings.to(dtype=torch.bfloat16)
+            interpolated_embeddings = interpolated_embeddings.to(dtype=input_embeddings.dtype)
             interpolated_embeddings.requires_grad_(True)
 
             # forward：batch = chunk_size
             self.model.zero_grad(set_to_none=True)
-            output = self.model(inputs_embeds=interpolated_embeddings)
-            logits = output.logits  # [chunk_size, L, V]
-
-            # Collect logits corresponding to answer positions
-            # target_logits: [chunk_size, A, V]
-            target_logits = logits[:, ans_start-1:ans_end-1, :]
+            # Avoid materializing [batch, sequence, vocabulary] logits. Only
+            # answer positions contribute to the paper's scalar objective.
+            hidden = self.model.model(
+                inputs_embeds=interpolated_embeddings,
+                use_cache=False,
+                return_dict=True,
+            ).last_hidden_state
+            target_hidden = hidden[:, ans_start - 1 : ans_end - 1, :]
+            lm_head_device = self.model.lm_head.weight.device
+            target_logits = self.model.lm_head(target_hidden.to(lm_head_device))
             log_probs = torch.nn.functional.log_softmax(target_logits, dim=-1)  # [chunk_size, A, V]
 
             # answer_token_ids: [A] -> [chunk_size, A]
-            answer_ids_expand = answer_token_ids.unsqueeze(0).expand(chunk_size, -1)  # [chunk_size, A]
+            answer_ids_expand = (
+                answer_token_ids.to(target_logits.device)
+                .unsqueeze(0)
+                .expand(chunk_size, -1)
+            )
 
             target_log_probs = log_probs.gather(
                 dim=-1,
@@ -146,12 +155,15 @@ class IntegratedGradientsAttribution:
 
             # Sum gradients over the chunk's interpolation points
             total_gradients += grads_chunk.sum(dim=0, keepdim=True)  # -> [1, L, D]
+            del hidden, target_hidden, target_logits, log_probs, target_log_probs, grads_chunk
             step_pos = chunk_end
 
         avg_gradients = total_gradients / steps  # [1, L, D]
         input_diff = input_embeddings - baseline_embeddings  # [1, L, D]
         attributions = (input_diff * avg_gradients).sum(dim=-1).squeeze(0)  # [L]
-        attributions = attributions / attributions.norm()
+        norm = attributions.norm()
+        if torch.isfinite(norm) and norm > 0:
+            attributions = attributions / norm
 
         step_scores = []
         for step_idx in step_indices:
@@ -162,15 +174,26 @@ class IntegratedGradientsAttribution:
         torch.cuda.empty_cache()
 
         return step_scores
-    
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--model_name", type=str, required=True, help="HuggingFace model name or local path")
     p.add_argument("--input_data", type=str, required=True, help="Path to input jsonl")
-    p.add_argument("--output_data_file", type=str, required=True, help="Path to output jsonl (appended)")
+    p.add_argument("--output_data_file", type=str, required=True, help="Path to attributed JSONL")
     p.add_argument("--output_ig_file", type=str, required=True, help="Path to output IG jsonl")
-    p.add_argument("--ig_steps", type=int, default=20, help="Number of IG steps")
+    p.add_argument("--ig_steps", type=int, default=50, help="Number of IG steps (paper default: 50)")
+    p.add_argument("--ig_batch_size", type=int, default=1, help="Interpolation points per forward pass")
+    p.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
+        help="Use more memory but avoid activation recomputation",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a validated partial output_data_file instead of replacing it",
+    )
     # p.add_argument("--baseline_token", type=str, default="pad", choices=["pad", "zero"], help="Baseline token choice")
     return p.parse_args()
 
@@ -181,18 +204,82 @@ if __name__ == "__main__":
         print(f"GPU {i} Memory: {torch.cuda.get_device_properties(i).total_memory / 1e9:.2f} GB")
 
     args = parse_args()
-    attribution_calculator = IntegratedGradientsAttribution(args.model_name)
+    if args.ig_steps <= 0:
+        raise ValueError("--ig_steps must be positive")
+    if args.ig_batch_size <= 0:
+        raise ValueError("--ig_batch_size must be positive")
+    attribution_calculator = IntegratedGradientsAttribution(
+        args.model_name,
+        gradient_checkpointing=not args.no_gradient_checkpointing,
+    )
 
     input_data = []
-    with open(args.input_data, "r") as f:
+    with open(args.input_data, "r", encoding="utf-8") as f:
         for line in f:
-            json_obj = json.loads(line.strip())  
-            input_data.append(json_obj)
+            if line.strip():
+                input_data.append(json.loads(line))
+    if not input_data:
+        raise SystemExit(f"No rows found in {args.input_data}")
 
-    os.makedirs(os.path.dirname(args.output_data_file), exist_ok=True)
-    with open(args.output_data_file, 'a') as f:
+    attribution_config = {
+        "model": args.model_name,
+        "ig_steps": args.ig_steps,
+        "baseline_token_id": attribution_calculator.tokenizer.pad_token_id,
+    }
+    output_dir = os.path.dirname(os.path.abspath(args.output_data_file))
+    os.makedirs(output_dir, exist_ok=True)
+
+    done = 0
+    write_mode = "w"
+    if args.resume and os.path.exists(args.output_data_file):
+        with open(args.output_data_file, encoding="utf-8") as f:
+            raw_lines = f.readlines()
+        existing = []
+        truncated_tail = False
+        for line_index, line in enumerate(raw_lines):
+            if not line.strip():
+                continue
+            try:
+                existing.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                if any(tail.strip() for tail in raw_lines[line_index + 1 :]):
+                    raise ValueError(
+                        f"Corrupt non-final row in {args.output_data_file}"
+                    ) from error
+                truncated_tail = True
+                break
+
+        if len(existing) > len(input_data):
+            raise ValueError(
+                "Resume output contains more rows than the current input dataset"
+            )
+        for index, record in enumerate(existing):
+            source = input_data[index]
+            if (
+                record.get("question") != source.get("question")
+                or record.get("segments") != source.get("segments")
+                or record.get("_attribution_config") != attribution_config
+                or "attribution" not in record
+            ):
+                raise ValueError(
+                    f"Resume output does not match input/config at row {index}; "
+                    "remove it or run without --resume"
+                )
+        missing_final_newline = bool(
+            raw_lines and raw_lines[-1].strip() and not raw_lines[-1].endswith("\n")
+        )
+        if truncated_tail or missing_final_newline:
+            with open(args.output_data_file, "w", encoding="utf-8") as f:
+                for record in existing:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            print(f"Repaired the final row boundary in {args.output_data_file}")
+        done = len(existing)
+        write_mode = "a"
+        print(f"Resuming attribution at row {done}/{len(input_data)}")
+
+    with open(args.output_data_file, write_mode, encoding="utf-8") as f:
         input_template = "{input}\nPlease reason step by step, and put your final answer within \\boxed{{}}."
-        for n in tqdm(range(len(input_data))): 
+        for n in tqdm(range(done, len(input_data)), initial=done, total=len(input_data)):
             each_data = input_data[n]
             user_msg = input_template.format(input=each_data["question"])
             user_tokens = attribution_calculator.tokenizer.apply_chat_template(
@@ -201,69 +288,126 @@ if __name__ == "__main__":
                 add_generation_prompt=True,
             )
             
-            pred_thoughts = each_data["segments"]  
-            assistant_token_spans = []
+            pred_thoughts = each_data["segments"]
+            if not pred_thoughts:
+                raise ValueError(f"Sample {n} has no reasoning segments")
+
+            # Tokenize the joined trace once. BPE tokenization is not prefix
+            # stable, so summing separately tokenized prefixes can move a
+            # segment boundary and assign the wrong IG values.
+            joined_thoughts = "".join(pred_thoughts)
+            encoded_thoughts = attribution_calculator.tokenizer(
+                joined_thoughts,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            assistant_tokens = encoded_thoughts["input_ids"]
+            token_offsets = encoded_thoughts["offset_mapping"]
+
+            segment_starts = []
             cursor = 0
-            for k in range(len(pred_thoughts)):
-                start = cursor
-                segments = "".join(pred_thoughts[:k+1])
-                end = len(attribution_calculator.tokenizer(segments, add_special_tokens=False)["input_ids"])
-                assistant_token_spans.append((start, end))
-                cursor = end
-            assistant_tokens = attribution_calculator.tokenizer("".join(pred_thoughts), add_special_tokens=False)["input_ids"] 
+            for segment in pred_thoughts:
+                segment_starts.append(cursor)
+                cursor += len(segment)
+            if cursor != len(joined_thoughts):
+                raise RuntimeError(f"Segment reconstruction failed for sample {n}")
+
+            first_token = {}
+            last_token = {}
+            segment_index = 0
+            for token_index, (char_start, char_end) in enumerate(token_offsets):
+                if char_end <= char_start:
+                    continue
+                while (
+                    segment_index + 1 < len(segment_starts)
+                    and char_start >= segment_starts[segment_index + 1]
+                ):
+                    segment_index += 1
+                first_token.setdefault(segment_index, token_index)
+                last_token[segment_index] = token_index
+            assistant_token_spans = [
+                (first_token[index], last_token[index] + 1)
+                if index in first_token
+                else (0, 0)
+                for index in range(len(pred_thoughts))
+            ]
 
             # Shift segment spans by user prompt length
             offset = len(user_tokens)
-            adjusted_spans = [(start + offset, end + offset) for (start, end) in assistant_token_spans]
+            adjusted_spans = [
+                (start + offset, end + offset) if end > start else (0, 0)
+                for start, end in assistant_token_spans
+            ]
 
             answer_string = "</think> So, the final answer is \\boxed{" + each_data['answer'] + "}"
             
-            answer_tokens = attribution_calculator.tokenizer(answer_string, add_special_tokens=False)["input_ids"] 
-            answer_tokens_split = attribution_calculator.tokenizer.convert_ids_to_tokens(answer_tokens)
-
-            for token_index in range(len(answer_tokens_split)):
-                if 'boxed' in answer_tokens_split[token_index]:
-                    ans_start = token_index + 1
-            assert '{' in answer_tokens_split[ans_start]
-            ans_end = len(answer_tokens_split)
-            is_end = False
-            stack = 0
-            for m in range(ans_start, len(answer_tokens_split)):
-                if '{' in answer_tokens_split[m] or '}' in answer_tokens_split[m]:
-                    for each_tok in answer_tokens_split[m]:
-                        if each_tok == "{":
-                            stack += 1
-                        elif each_tok == "}":
-                            stack -= 1
-                            if stack == 0:
-                                ans_end = m #+1
-                                is_end = True
-                                break
-                    if is_end:
+            marker = answer_string.rfind("\\boxed")
+            opening = answer_string.find("{", marker)
+            if marker < 0 or opening < 0:
+                raise ValueError(f"Could not locate boxed answer for sample {n}")
+            depth = 0
+            closing = None
+            for char_index in range(opening, len(answer_string)):
+                if answer_string[char_index] == "{":
+                    depth += 1
+                elif answer_string[char_index] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        closing = char_index
                         break
+            if closing is None or closing <= opening + 1:
+                raise ValueError(f"Could not locate boxed answer content for sample {n}")
+
+            encoded_answer = attribution_calculator.tokenizer(
+                answer_string,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            answer_tokens = encoded_answer["input_ids"]
+            answer_token_indices = [
+                token_index
+                for token_index, (char_start, char_end) in enumerate(
+                    encoded_answer["offset_mapping"]
+                )
+                if char_end > opening + 1 and char_start < closing
+            ]
+            if not answer_token_indices:
+                raise ValueError(f"Boxed answer has no target tokens for sample {n}")
+            ans_start = answer_token_indices[0]
+            ans_end = answer_token_indices[-1] + 1
             
             full_tokens = user_tokens + assistant_tokens + answer_tokens
-            answer_indices = (ans_start + 1 + len(user_tokens + assistant_tokens), ans_end + len(user_tokens + assistant_tokens))
+            answer_offset = len(user_tokens) + len(assistant_tokens)
+            answer_indices = (ans_start + answer_offset, ans_end + answer_offset)
 
-            print("answer tokens", answer_tokens_split[ans_start: ans_end+1], adjusted_spans)
-            # importance_scores = attribution_calculator.compute_step_to_answer_attribution_integrated(full_tokens, adjusted_spans, answer_indices, baseline_token_id=attribution_calculator.tokenizer.pad_token_id, steps=args.ig_steps)
-            importance_scores = attribution_calculator.batch_compute_step_to_answer_attribution_integrated(full_tokens, adjusted_spans, answer_indices, baseline_token_id=attribution_calculator.tokenizer.pad_token_id, steps=args.ig_steps)   
+            importance_scores = attribution_calculator.batch_compute_step_to_answer_attribution_integrated(
+                full_tokens,
+                adjusted_spans,
+                answer_indices,
+                baseline_token_id=attribution_calculator.tokenizer.pad_token_id,
+                steps=args.ig_steps,
+                batch_size=args.ig_batch_size,
+            )
             input_data[n]["attribution"] = importance_scores
+            input_data[n]["_attribution_config"] = attribution_config
 
-            f.write(json.dumps(input_data[n], ensure_ascii=False) + '\n') 
+            f.write(json.dumps(input_data[n], ensure_ascii=False) + '\n')
+            f.flush()
 
-   
-    attribution_output_data = []     
-    with open(args.output_data_file, 'r') as f: 
-        for line in f:
-            json_obj = json.loads(line.strip())  
-            attribution_output_data.append(json_obj)
-    print(len(attribution_output_data)) 
-
-    all_IG = []
-    for n, each_data in enumerate(attribution_output_data):
-        all_IG.append(each_data["attribution"])
-    with open(args.output_ig_file, "w") as f:
-        for each in all_IG:
-            f.write(json.dumps(each, ensure_ascii=False) + '\n') 
-    
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_ig_file)), exist_ok=True)
+    row_count = 0
+    with open(args.output_data_file, encoding="utf-8") as source, open(
+        args.output_ig_file, "w", encoding="utf-8"
+    ) as destination:
+        for line in source:
+            if not line.strip():
+                continue
+            destination.write(
+                json.dumps(json.loads(line)["attribution"], ensure_ascii=False) + "\n"
+            )
+            row_count += 1
+    if row_count != len(input_data):
+        raise RuntimeError(
+            f"Attributed row count mismatch: wrote {row_count}, expected {len(input_data)}"
+        )
+    print(f"Wrote {row_count} attribution rows to {args.output_ig_file}")

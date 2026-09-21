@@ -21,7 +21,7 @@ from model_utils import load_hf_lm_and_tokenizer, generate_completions
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_names", default="gsm8k,math", type=str)
+    parser.add_argument("--data_names", "--data_name", dest="data_names", default="gsm8k,math", type=str)
     parser.add_argument("--data_dir", default="../data", type=str)
     parser.add_argument("--model_name_or_path", default="gpt-4", type=str)
     parser.add_argument("--output_dir", default="./output", type=str)
@@ -34,6 +34,9 @@ def parse_args():
     parser.add_argument("--temperature", default=0, type=float)
     parser.add_argument("--n_sampling", default=1, type=int)
     parser.add_argument("--top_p", default=1, type=float)
+    parser.add_argument("--top_k", default=-1, type=int)
+    parser.add_argument("--min_p", default=0.0, type=float)
+    parser.add_argument("--repetition_penalty", default=1.0, type=float)
     parser.add_argument("--max_tokens_per_call", default=2048, type=int)
     parser.add_argument("--shuffle", action="store_true")
     parser.add_argument("--use_vllm", action="store_true")
@@ -48,6 +51,21 @@ def parse_args():
         help="Apply chat template to prompt.",
     )
     parser.add_argument("--pipeline_parallel_size", type=int, default=1)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--max_model_len", type=int, default=0)
+    parser.add_argument("--enable_prefix_caching", action="store_true")
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable the Qwen3 thinking chat template",
+    )
+    parser.add_argument(
+        "--prefill-think",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append <think> to the assistant prefix (must match SFT)",
+    )
     parser.add_argument(
         "--adapt_few_shot",
         action="store_true",
@@ -121,12 +139,18 @@ def setup(args):
         data_list = need_eval_data_list
     
     if args.use_vllm:
-        llm = LLM(
+        llm_kwargs = dict(
             model=args.model_name_or_path,
             tensor_parallel_size=len(available_gpus) // args.pipeline_parallel_size,
             pipeline_parallel_size=args.pipeline_parallel_size,
             trust_remote_code=True,
+            seed=args.seed,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_prefix_caching=args.enable_prefix_caching,
         )
+        if args.max_model_len > 0:
+            llm_kwargs["max_model_len"] = args.max_model_len
+        llm = LLM(**llm_kwargs)
         tokenizer = None
         if args.apply_chat_template:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -139,6 +163,20 @@ def setup(args):
             use_fast_tokenizer=True,
             use_safetensors=args.use_safetensors,
         )
+
+    args.stop_token_ids = []
+    args.is_qwen3 = False
+    if tokenizer is not None:
+        vocabulary = tokenizer.get_vocab()
+        args.is_qwen3 = "<think>" in vocabulary and "</think>" in vocabulary
+        for token_id in (tokenizer.eos_token_id, tokenizer.pad_token_id):
+            if token_id is not None and token_id not in args.stop_token_ids:
+                args.stop_token_ids.append(token_id)
+        for token in ("<|im_end|>", "<|endoftext|>"):
+            if token in vocabulary:
+                token_id = tokenizer.convert_tokens_to_ids(token)
+                if token_id not in args.stop_token_ids:
+                    args.stop_token_ids.append(token_id)
 
     # infer & eval
     results = []
@@ -262,14 +300,22 @@ def main(llm, tokenizer, data_name, args):
                     for prompt in input_prompts
                 ] 
         else:
-            input_prompts = [
-                tokenizer.apply_chat_template(
+            formatted_prompts = []
+            for prompt in input_prompts:
+                template_kwargs = {
+                    "tokenize": False,
+                    "add_generation_prompt": True,
+                }
+                if args.is_qwen3:
+                    template_kwargs["enable_thinking"] = args.enable_thinking
+                formatted = tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt.strip()}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ) 
-                for prompt in input_prompts
-            ]
+                    **template_kwargs,
+                )
+                if args.prefill_think and not formatted.endswith("<think>\n"):
+                    formatted += "<think>\n"
+                formatted_prompts.append(formatted)
+            input_prompts = formatted_prompts
 
     
     print(input_prompts[0])
@@ -306,21 +352,25 @@ def main(llm, tokenizer, data_name, args):
         # get all outputs
         prompts = [item[1] for item in current_prompts]
         if args.use_vllm:
-            outputs = llm.generate(
-                prompts,
+            sampling_params = [
                 SamplingParams(
                     temperature=args.temperature,
                     top_p=args.top_p,
+                    top_k=args.top_k,
+                    min_p=args.min_p,
+                    repetition_penalty=args.repetition_penalty,
                     max_tokens=args.max_tokens_per_call,
                     n=1,
+                    # Repeated prompts must use independent, reproducible streams.
+                    seed=args.seed + request_index + epoch * len(input_prompts),
                     stop=stop_words,
-                    stop_token_ids=(
-                        [151645, 151643]
-                        if "qwen" in args.model_name_or_path.lower()
-                        else None
-                    ),
-                    logprobs=1
-                ),
+                    stop_token_ids=args.stop_token_ids or None,
+                )
+                for request_index, _ in current_prompts
+            ]
+            outputs = llm.generate(
+                prompts,
+                sampling_params,
             )
 
             outputs = sorted(

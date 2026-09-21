@@ -1,196 +1,291 @@
-import os
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-os.environ["UNSLOTH_DISABLE_FAST_GENERATION"] = "1"
-from unsloth import FastLanguageModel 
-from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
-import torch
+#!/usr/bin/env python3
+"""Full-parameter full-CoT or segment-selective SFT for the paper pipeline."""
+
 import argparse
-from trl import SFTTrainer, SFTConfig
-from datasets import load_dataset
-from unsloth import is_bfloat16_supported
-import re
 import gc
-pattern = r"(\n\nWait|\n\nAlternatively|\n\nBut wait|\n\nBut alternatively|\n\nBut just to|\n\nHowever|\n\nNot sure|\n\nGoing back|\n\nBacktrack|\n\nTrace back|\n\nAnother)" #|\n\n\*\*Final Answer
-# pattern = r"(\n\nWait|\n\nAlternatively|\n\nBut|\n\nHowever|\n\nHmmm|\n\nHmm|\n\nNot sure|\n\nGoing back|\n\nBacktrack|\n\nTrace back|\n\nAnother)" 
-os.environ["WANDB_PROJECT"] = "***" 
+import os
+import sys
 
+os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
+os.environ.setdefault("UNSLOTH_DISABLE_FAST_GENERATION", "1")
 
-class EarlyStopAtEpochCallback(TrainerCallback):
-    def on_epoch_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        if state.epoch >= 9:
-            print(f"Epoch {state.epoch:.1f} reached. Stopping training early.")
-            control.should_training_stop = True
-        return control
+# Unsloth must be imported before TRL so its compatibility patches are active.
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from datasets import load_dataset
+from trl import SFTConfig, SFTTrainer
+import torch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+from segment_utils import SEGMENT_MODES, split_segments
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_names", default="GAIR/LIMO", type=str)
-    parser.add_argument("--model_name_or_path", default="unsloth/Qwen2.5-7B-Instruct", type=str)
-    parser.add_argument("--output_dir", default="./outputs_qwen25_7b_instruct_no4bit_epoch5_lr5e-6", type=str)
-    parser.add_argument("--split", default="train", type=str)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--data_names", default=os.path.join(ROOT, "data/limo/train.jsonl"))
+    parser.add_argument("--model_name_or_path", default="Qwen/Qwen3-8B")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--split", default="train")
     parser.add_argument("--load_in_4bit", action="store_true")
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--max_seq_length", type=int, default=16384) #16384 32768
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--deepseek", action="store_true")
-    parser.add_argument("--mask", action="store_true")
-    parser.add_argument("--apply_all", action="store_true")
+    parser.add_argument("--max_seq_length", type=int, default=16384)
+    parser.add_argument("--epochs", type=float, default=4)
+    parser.add_argument("--learning_rate", type=float, default=8e-6)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05)
+    parser.add_argument("--optim", default="adamw_8bit")
+    parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument("--dataset_num_proc", type=int, default=1)
+    parser.add_argument("--report_to", default="none")
+    parser.add_argument("--mask", action="store_true", help="Use segment-selective labels")
+    parser.add_argument("--segment_mode", choices=SEGMENT_MODES, default="cue")
+    parser.add_argument(
+        "--enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pass enable_thinking to the Qwen3 chat template",
+    )
+    parser.add_argument(
+        "--prefill-think",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prefill <think> before the LIMO reasoning trace; eval must match",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    return args
 
-args = parse_args()
-print(args.load_in_4bit, args.deepseek)
+def segment_char_bounds(segments, offset):
+    bounds = []
+    cursor = offset
+    for segment in segments:
+        bounds.append((cursor, cursor + len(segment)))
+        cursor += len(segment)
+    return bounds
 
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = args.model_name_or_path,
-    max_seq_length = args.max_seq_length, # Choose any for long context!
-    load_in_4bit = args.load_in_4bit,  # 4 bit quantization to reduce memory
-    full_finetuning = True, # [NEW!] We have full finetuning now!
-)
 
-if not args.deepseek:
-    args.run_name = args.model_name_or_path.split("/")[-1] + "max_seq_" + str(args.max_seq_length) + "lr_" + str(args.learning_rate) + "epochs_" + str(args.epochs)
-    args.output_dir = f"./checkpoints/{args.model_name_or_path.split('/')[-1]}_epoch{args.epochs}_lr{args.learning_rate}"
-    instruction_template = "<|im_start|>user"
-    response_template = "<|im_start|>assistant\n"+"<think>\n"
-    
-    tokenizer.add_special_tokens({"additional_special_tokens": ["<think>", "</think>", "<|reason_pad|>"]})
-    model.resize_token_embeddings(len(tokenizer))
-else:
-    args.run_name = args.model_name_or_path.split("/")[-1] + "max_seq_" + str(args.max_seq_length) + "lr_" + str(args.learning_rate) + "epochs_" + str(args.epochs)
-    args.output_dir = f"./checkpoints/{args.model_name_or_path.split('/')[-1]}_epoch{args.epochs}_lr{args.learning_rate}_len{args.max_seq_length}"
-    instruction_template = "<｜begin▁of▁sentence｜><｜User｜>"
-    response_template = "<｜Assistant｜><think>\n"
+def load_training_dataset(path_or_id, split):
+    if os.path.isfile(path_or_id) or path_or_id.endswith((".json", ".jsonl")):
+        return load_dataset("json", data_files=path_or_id, split="train")
+    return load_dataset(path_or_id, split=split)
 
-model.config.use_cache = False
-model.gradient_checkpointing_enable()
-model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-def formatting_prompts_func(examples):
-    questions = examples["question"]
-    outputs = examples["solution"] 
-    segments_ids = examples["selected_spans_ids"]
+def main():
+    args = parse_args()
+    if args.max_seq_length <= 0:
+        raise SystemExit("--max_seq_length must be positive")
+    if args.epochs <= 0:
+        raise SystemExit("--epochs must be positive")
+    if args.learning_rate <= 0:
+        raise SystemExit("--learning_rate must be positive")
+    if args.per_device_train_batch_size <= 0:
+        raise SystemExit("--per_device_train_batch_size must be positive")
+    if args.gradient_accumulation_steps <= 0:
+        raise SystemExit("--gradient_accumulation_steps must be positive")
+    if args.load_in_4bit:
+        raise SystemExit(
+            "--load_in_4bit is incompatible with this paper-faithful "
+            "full-parameter training path"
+        )
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    print(len(outputs), len(questions), len(segments_ids))
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=args.model_name_or_path,
+        max_seq_length=args.max_seq_length,
+        load_in_4bit=args.load_in_4bit,
+        full_finetuning=True,
+    )
+    if not tokenizer.is_fast:
+        raise SystemExit("A fast tokenizer is required for exact character-offset masking")
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    input_ids_list = []
-    labels_list = []
-    num = 0
-    for prompt, output, segment_id in zip(questions, outputs, segments_ids):
-        messages = [
-            {"role": "user", "content": prompt + "\nPlease reason step by step, and put your final answer within \\boxed{}."},
-        ]
-  
-        input_str = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )   
-        if not args.deepseek:
-            full_text = input_str + "<think>\n" + output  
-        else:
-            full_text = input_str + output 
-        
-        full_tokens = tokenizer(full_text, truncation=True, max_length=args.max_seq_length)
-        input_ids = full_tokens['input_ids']
-        labels = [-100] * len(input_ids)
-        
-        response_tokens = tokenizer(response_template, add_special_tokens=False)['input_ids']
-        response_start = None
-        for i in range(len(input_ids) - len(response_tokens) + 1):
-            if input_ids[i:i+len(response_tokens)] == response_tokens:
-                response_start = i + len(response_tokens)
-                break
-            
-        assert response_start is not None
-        
-        if not args.mask or (not args.apply_all and len(input_ids) < 4000):
-            if response_start is not None:
-                labels[response_start:] = input_ids[response_start:]       
-        else:
-            num += 1
-            parts = re.split(pattern, output)
-            segment = [parts[0]]  
-            for j in range(1, len(parts), 2):
-                segment.append(parts[j] + parts[j + 1])  
-                
-            # add_ids = [0, len(segment)-1]  
-            add_ids = [0, len(segment)-2, len(segment)-1]            
-            segment_id = sorted(list(set(add_ids + segment_id)))
-                
-            if response_start is not None:
-                for each_id in segment_id:
-                    cur_seg = segment[each_id]
-                    pre_segs = "".join(segment[:each_id])
-                    pre_segs_tokens = tokenizer(pre_segs, add_special_tokens=False)['input_ids']
-                    cur_seg_tokens = tokenizer(cur_seg, add_special_tokens=False)['input_ids']
-                    target_start = response_start + len(pre_segs_tokens)
-                    target_end = target_start + len(cur_seg_tokens)
-                    if response_start + len(pre_segs_tokens) + len(cur_seg_tokens) <= args.max_seq_length:
-                        labels[target_start:target_end] = input_ids[target_start:target_end]
-                    else:
-                        labels[target_start:] = input_ids[target_start:]
+    is_qwen3 = getattr(model.config, "model_type", "").lower().startswith("qwen3")
+    if not is_qwen3:
+        print(
+            "Warning: the default workflow is designed for Qwen3; loaded model_type=%r"
+            % getattr(model.config, "model_type", None)
+        )
+
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    model.config.use_cache = False
+
+    dataset = load_training_dataset(args.data_names, args.split)
+    if args.mask and "selected_spans_ids" not in dataset.column_names:
+        raise SystemExit(
+            "--mask requires selected_spans_ids from Attribution/get_important_segments.py"
+        )
+
+    skipped = {"no_supervised_tokens": 0}
+
+    def formatting_prompts_func(examples):
+        questions = examples["question"]
+        outputs = examples["solution"]
+        selected_batch = examples.get("selected_spans_ids") or [[] for _ in questions]
+        stored_segments_batch = examples.get("segments") or [None for _ in questions]
+
+        input_ids_list = []
+        labels_list = []
+        for question, output, selected_ids, stored_segments in zip(
+            questions, outputs, selected_batch, stored_segments_batch
+        ):
+            messages = [
+                {
+                    "role": "user",
+                    "content": question
+                    + "\nPlease reason step by step, and put your final answer within \\boxed{}.",
+                }
+            ]
+            chat_kwargs = {
+                "tokenize": False,
+                "add_generation_prompt": True,
+            }
+            if is_qwen3:
+                chat_kwargs["enable_thinking"] = args.enable_thinking
+            prompt_text = tokenizer.apply_chat_template(messages, **chat_kwargs)
+            think_prefix = "<think>\n" if args.prefill_think else ""
+            if is_qwen3:
+                # Match Qwen3's native assistant serialization. LIMO supplies
+                # one reasoning trace, so it remains inside the thinking block;
+                # the format suffix teaches the model to close and terminate.
+                response_suffix = (
+                    "\n</think>\n\n" + tokenizer.eos_token + "\n"
+                    if args.prefill_think
+                    else tokenizer.eos_token + "\n"
+                )
+            else:
+                response_suffix = tokenizer.eos_token or ""
+            full_text = prompt_text + think_prefix + output + response_suffix
+            response_char = len(prompt_text) + len(think_prefix)
+            response_end_char = response_char + len(output)
+
+            encoded = tokenizer(
+                full_text,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=args.max_seq_length,
+                return_offsets_mapping=True,
+            )
+            input_ids = encoded["input_ids"]
+            offsets = encoded["offset_mapping"]
+            labels = [-100] * len(input_ids)
+
+            bounds = None
+            keep = None
+            if args.mask:
+                segments = split_segments(output, args.segment_mode)
+                if stored_segments is not None and list(stored_segments) != segments:
+                    raise ValueError(
+                        "Stored segments do not match --segment_mode=%s" % args.segment_mode
+                    )
+                # Paper Appendix C adds the first and last segment to the IG selection.
+                keep = {0, len(segments) - 1, *[int(index) for index in selected_ids]}
+                keep = {index for index in keep if 0 <= index < len(segments)}
+                bounds = segment_char_bounds(segments, response_char)
+
+            supervised = 0
+            for token_index, (char_start, char_end) in enumerate(offsets):
+                if char_end <= char_start or char_start < response_char:
+                    continue
+                if bounds is None:
+                    labels[token_index] = input_ids[token_index]
+                    supervised += 1
+                    continue
+                # The last reasoning segment is always selected. Supervise the
+                # Qwen3 closing-thinking and EOS format tokens with it so eval
+                # can stop normally instead of running to the token limit.
+                if char_start >= response_end_char:
+                    labels[token_index] = input_ids[token_index]
+                    supervised += 1
+                    continue
+                for segment_index, (segment_start, segment_end) in enumerate(bounds):
+                    if segment_start <= char_start < segment_end:
+                        if segment_index in keep:
+                            labels[token_index] = input_ids[token_index]
+                            supervised += 1
                         break
 
-        input_ids_list.append(input_ids)
-        labels_list.append(labels)
+            if supervised == 0:
+                skipped["no_supervised_tokens"] += 1
+                continue
+            input_ids_list.append(input_ids)
+            labels_list.append(labels)
 
-    print("totoal num", num, len(input_ids_list))
-    return {
-        "input_ids": input_ids_list,
-        "labels": labels_list
-    }
-if "json" in args.data_names:
-    dataset = load_dataset("json", data_files=args.data_names)['train']
-else:
-    dataset = load_dataset(args.data_names, split = "train")
+        return {"input_ids": input_ids_list, "labels": labels_list}
 
-dataset = dataset.map(
-    formatting_prompts_func,
-    batched=True,
-    remove_columns=["question", "solution", "answer", "selected_spans_ids", "segments"],  
-    load_from_cache_file=False,
-)
-print(len(dataset), dataset[0].keys())
-gc.collect()
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
+    original_columns = dataset.column_names
+    dataset = dataset.map(
+        formatting_prompts_func,
+        batched=True,
+        remove_columns=original_columns,
+        load_from_cache_file=False,
+        num_proc=args.dataset_num_proc,
+        desc="Tokenizing and building selective labels",
+    )
+    if not len(dataset):
+        raise SystemExit("No training samples remain after tokenization/truncation")
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    effective_batch = (
+        args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    print("=" * 72)
+    print("model             :", args.model_name_or_path)
+    print("mode              :", "selective" if args.mask else "full-CoT")
+    print("finetuning        : full parameters")
+    print("samples           :", len(dataset), "skipped:", skipped)
+    print("max sequence      :", args.max_seq_length)
+    print("effective batch   :", effective_batch)
+    print("epochs / lr       :", args.epochs, "/", args.learning_rate)
+    print("output            :", args.output_dir)
+    print("=" * 72)
+
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        args=SFTConfig(
+            max_length=args.max_seq_length,
+            dataset_num_proc=args.dataset_num_proc,
+            packing=False,
+            remove_unused_columns=False,
+            dataset_kwargs={"skip_prepare_dataset": True},
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            warmup_ratio=args.warmup_ratio,
+            num_train_epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            fp16=not is_bfloat16_supported(),
+            bf16=is_bfloat16_supported(),
+            logging_steps=1,
+            lr_scheduler_type="cosine",
+            output_dir=args.output_dir,
+            optim=args.optim,
+            seed=args.seed,
+            report_to=args.report_to,
+            run_name=os.path.basename(os.path.abspath(args.output_dir)),
+            save_strategy="epoch",
+            overwrite_output_dir=True,
+            save_total_limit=2,
+            save_only_model=True,
+            gradient_checkpointing=True,
+            max_grad_norm=1.0,
+        ),
+    )
+    trainer.train()
+
+    final_dir = os.path.join(args.output_dir, "final")
+    model.config.use_cache = True
+    trainer.save_model(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(f"Final model saved to {final_dir}")
 
 
-trainer = SFTTrainer(
-    model = model,
-    train_dataset = dataset,
-    tokenizer = tokenizer,
-    dataset_num_proc=2,
-    packing = False,
-    args = SFTConfig(
-        max_seq_length = args.max_seq_length,
-        remove_unused_columns = False,
-        dataset_kwargs = {"skip_prepare_dataset": True},
-        per_device_train_batch_size = 2,
-        gradient_accumulation_steps = 1,
-        warmup_ratio = 0.05,
-        num_train_epochs = args.epochs, 
-        learning_rate = args.learning_rate,
-        fp16 = not is_bfloat16_supported(),
-        bf16 = is_bfloat16_supported(),
-        logging_steps = 1,
-        lr_scheduler_type = "cosine",
-        output_dir = args.output_dir,
-        optim = "adamw_8bit", 
-        seed = 3407,
-        report_to = "wandb", 
-        run_name = args.run_name,
-        save_strategy = "epoch",
-        overwrite_output_dir=True,
-        save_total_limit = 3,
-        save_only_model=True,
-        gradient_checkpointing=True,
-        max_grad_norm=1.0
-    ),
-    callbacks=[EarlyStopAtEpochCallback()],
-)
-trainer.train()
+if __name__ == "__main__":
+    main()

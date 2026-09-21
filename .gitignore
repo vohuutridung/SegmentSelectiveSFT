@@ -1,0 +1,12 @@
+.venv_*/
+.cache/
+artifacts/
+logs/
+data/aime25/
+data/amc12/
+data/limo/train.jsonl
+Attribution/processed_data/
+Eval/outputs_*/
+__pycache__/
+*.py[cod]
+.DS_Store

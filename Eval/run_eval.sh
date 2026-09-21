@@ -1,49 +1,64 @@
 #!/usr/bin/env bash
+set -Eeuo pipefail
 
-export CUDA_VISIBLE_DEVICES="0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+export CUDA_VISIBLE_DEVICES="${GPU_EVAL:-0}"
 export TOKENIZERS_PARALLELISM=false
 
-task_configurations=(
-    "aime24 32" 
-    "amc23 32" 
-    "math500 6" 
-    "minerva 6" 
-    "gpqa 6" 
-    "olympiad 6" 
-)
+MODEL_PATH="${MODEL_PATH:-${1:-Qwen/Qwen3-8B}}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_qwen3_8b_selective}"
+RUN_TAG="${RUN_TAG:-qwen3_8b_selective}"
+TASK_SPECS="${TASK_SPECS:-aime24:32 aime25:32 amc12:32 math500:6}"
+SEED="${SEED:-0}"
+MAX_TOKENS="${MAX_TOKENS:-32768}"
+TEMPERATURE="${TEMPERATURE:-0.6}"
+TOP_P="${TOP_P:-1.0}"
+TOP_K="${TOP_K:--1}"
+MIN_P="${MIN_P:-0}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-0}"
+OVERWRITE="${OVERWRITE:-0}"
 
-# =========================
-# Configuration
-# =========================
-MODEL_PATH="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-OUTPUT_ROOT="outputs_origin"
-SEED=0
-MAX_TOKENS=32768
-TEMPERATURE=0.6
+PIPELINE_PARALLEL_SIZE="${PIPELINE_PARALLEL_SIZE:-1}"
 
-for config in "${task_configurations[@]}"; do
-  read -r task sample_n <<< "$config"
+for spec in $TASK_SPECS; do
+  task="${spec%%:*}"
+  samples="${spec##*:}"
+  echo "============================================================"
+  echo "task=${task} samples_per_question=${samples} model=${MODEL_PATH}"
+  echo "============================================================"
 
-  echo "=============================================="
-  echo "Running task: ${task}"
-  echo "Samples per query: ${sample_n}"
-  echo "=============================================="
-
-  python -u math_eval.py \
-      --model_name_or_path "${MODEL_PATH}" \
-      --data_name "${task}" \
-      --output_dir "${OUTPUT_ROOT}/${task}/r1_qwen_7b" \
-      --split "test" \
-      --prompt_type "deepseek-longcot" \
-      --num_test_sample -1 \
-      --max_tokens_per_call "${MAX_TOKENS}" \
-      --seed "${SEED}" \
-      --temperature "${TEMPERATURE}" \
-      --n_sampling "${sample_n}" \
-      --top_p 1 \
-      --start 0 \
-      --end -1 \
-      --use_vllm \
-      --save_outputs \
-      --apply_chat_template
+  eval_command=("$PYTHON_BIN" -u math_eval.py \
+    --model_name_or_path "$MODEL_PATH" \
+    --data_name "$task" \
+    --data_dir "${SCRIPT_DIR}/../data" \
+    --output_dir "${OUTPUT_ROOT}/${task}/${RUN_TAG}" \
+    --split test \
+    --prompt_type deepseek-longcot \
+    --num_test_sample -1 \
+    --max_tokens_per_call "$MAX_TOKENS" \
+    --seed "$SEED" \
+    --temperature "$TEMPERATURE" \
+    --n_sampling "$samples" \
+    --top_p "$TOP_P" \
+    --top_k "$TOP_K" \
+    --min_p "$MIN_P" \
+    --pipeline_parallel_size "$PIPELINE_PARALLEL_SIZE" \
+    --gpu_memory_utilization "$GPU_MEMORY_UTILIZATION" \
+    --use_vllm \
+    --save_outputs \
+    --apply_chat_template \
+    --enable-thinking \
+    --prefill-think \
+    --enable_prefix_caching)
+  if [[ "$MAX_MODEL_LEN" != "0" ]]; then
+    eval_command+=(--max_model_len "$MAX_MODEL_LEN")
+  fi
+  if [[ "$OVERWRITE" == "1" ]]; then
+    eval_command+=(--overwrite)
+  fi
+  "${eval_command[@]}"
 done
