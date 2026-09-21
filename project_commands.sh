@@ -64,6 +64,7 @@ TRAIN_DATA="${ROOT_DIR}/data/s1k/train.jsonl"
 SEGMENT_FILE="${ARTIFACT_DIR}/attribution/s1k_solution_segments.jsonl"
 ATTRIBUTED_FILE="${ARTIFACT_DIR}/attribution/s1k_attributed_J${IG_STEPS}.jsonl"
 IG_FILE="${ARTIFACT_DIR}/attribution/s1k_IG_J${IG_STEPS}.jsonl"
+IG_COMPACT_FILE="${ARTIFACT_DIR}/attribution/s1k_IG_J${IG_STEPS}_compact.jsonl"
 SELECTED_DATA="${ARTIFACT_DIR}/data/s1k_solutions_selected.jsonl"
 TRAIN_OUTPUT="${ARTIFACT_DIR}/qwen3_8b_selective_lora_r${LORA_R}"
 ADAPTER_MODEL="${TRAIN_OUTPUT}/final"
@@ -174,6 +175,7 @@ stage_attribution() {
     --input_data "$SEGMENT_FILE"
     --output_data_file "$ATTRIBUTED_FILE"
     --output_ig_file "$IG_FILE"
+    --output_compact_file "$IG_COMPACT_FILE"
     --ig_steps "$IG_STEPS"
     --ig_batch_size "$IG_BATCH_SIZE")
   [[ "$ATTR_RESUME" == "1" ]] && attribution_command+=(--resume)
@@ -182,10 +184,10 @@ stage_attribution() {
   run_logged select_segments "$EVAL_PY" \
     "${ROOT_DIR}/Attribution/get_important_segments.py" \
     --input_data_file "$SEGMENT_FILE" \
-    --IG_score_data_file "$IG_FILE" \
+    --IG_score_data_file "$IG_COMPACT_FILE" \
     --output_data_file "$SELECTED_DATA" \
     --cumulative_ratio 0.7 \
-    --consistency_max 0.8
+    --coherence_max 0.8
 }
 
 stage_train() {

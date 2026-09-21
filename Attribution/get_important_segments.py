@@ -9,7 +9,13 @@ def parse_args():
     p.add_argument("--IG_score_data_file", type=str, required=True, help="Path to input IG scores")
     p.add_argument("--output_data_file", type=str, required=True, help="Path to output jsonl")
     p.add_argument("--cumulative_ratio", type=float, default=0.7)
-    p.add_argument("--consistency_max", type=float, default=0.8)
+    p.add_argument(
+        "--coherence_max",
+        "--consistency_max",
+        dest="consistency_max",
+        type=float,
+        default=0.8,
+    )
     return p.parse_args()
 
 args = parse_args()
@@ -24,11 +30,27 @@ with open(args.input_data_file, "r") as f:
         json_obj = json.loads(line.strip())  
         input_data.append(json_obj)
 
+def to_compact(row):
+    if isinstance(row, dict):
+        return [tuple(segment) for segment in row["segments"]]
+    compact = []
+    for segment in row:
+        token_count = len(segment)
+        compact.append(
+            (
+                token_count,
+                float(np.sum(np.abs(segment))) if token_count else 0.0,
+                float(np.sum(segment)) if token_count else 0.0,
+            )
+        )
+    return compact
+
+
 all_IG_list = []
 with open(args.IG_score_data_file, "r") as f: 
     for line in f:
-        json_obj = json.loads(line.strip())  
-        all_IG_list.append(json_obj)
+        if line.strip():
+            all_IG_list.append(to_compact(json.loads(line)))
 print("sample number", len(input_data), len(all_IG_list))
 if len(input_data) != len(all_IG_list):
     raise ValueError(
@@ -44,10 +66,9 @@ for i in range(len(input_data)):
         raise ValueError(f"Sample {i} has no segments")
         
     all_segs_IG_stres = []
-    for each_seg in cur_IGs:
-        abs_each_seg = [abs(_) for _ in each_seg]
+    for token_count, sum_abs, _sum_signed in cur_IGs:
         all_segs_IG_stres.append(
-            np.sum(abs_each_seg) / (len(abs_each_seg) ** 0.5) if abs_each_seg else 0.0
+            sum_abs / (token_count ** 0.5) if token_count else 0.0
         )
     indexed_sorted = sorted(enumerate(all_segs_IG_stres), key=lambda x: -x[1])
     sorted_indices = [idx for idx, val in indexed_sorted]
@@ -63,9 +84,10 @@ for i in range(len(input_data)):
         important_index = sorted(sorted_indices[: cutoff + 1])
         
     IG_dire_list = []
-    for _ in range(len(input_data[i]["segments"])):
-        denominator = np.sum(np.abs(cur_IGs[_]))
-        IG_dire_list.append(abs(np.sum(cur_IGs[_])) / denominator if denominator else 0.0)
+    for _token_count, denominator, signed_sum in cur_IGs:
+        # Match the comparison folder: a zero-attribution segment is treated
+        # as maximally coherent and therefore excluded by the 0.8 threshold.
+        IG_dire_list.append(abs(signed_sum) / denominator if denominator else 1.0)
     
     select_span_ids = [
         index for index in important_index if IG_dire_list[index] <= args.consistency_max

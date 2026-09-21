@@ -86,7 +86,21 @@ def first_present(row, keys):
 
 
 def convert_row(task, row, index):
-    if task in {"s1k", "limo"}:
+    if task == "s1k":
+        question = first_present(row, ("question", "problem"))
+        solution = first_present(row, ("solution", "response"))
+        answer = first_present(row, ("answer",)) or last_boxed(solution)
+        if question is None or solution is None or answer is None:
+            raise ValueError(f"{task} row {index} is missing question/solution/answer")
+        # baesad/s1K-1.1-deepseek-cot already ships the comparison folder's
+        # question/solution/answer JSONL schema. Preserve the strings verbatim.
+        return {
+            "question": str(question),
+            "solution": str(solution),
+            "answer": str(answer),
+        }
+
+    if task == "limo":
         question = first_present(row, ("question", "problem"))
         solution = first_present(row, ("solution", "response"))
         answer = first_present(row, ("answer",)) or last_boxed(solution)
@@ -105,11 +119,11 @@ def convert_row(task, row, index):
         raise ValueError(f"{task} row {index} is missing question/answer")
     record = {
         "idx": index,
-        "question": str(question).strip(),
+        "question": str(question),
         "answer": normalize_answer(answer),
     }
     if solution is not None:
-        record["solution"] = str(solution).strip()
+        record["solution"] = str(solution)
     if task == "math500" and "solution" not in record:
         record["solution"] = f"\\boxed{{{record['answer']}}}"
     return record

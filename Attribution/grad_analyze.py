@@ -1,5 +1,6 @@
 import os
 import json
+import numpy as np
 import torch
 from tqdm import tqdm
 import argparse
@@ -92,12 +93,15 @@ class IntegratedGradientsAttribution:
             input_embeddings = self._embed(input_ids)  # [1, L, D]
             baseline_embeddings = self._embed(torch.full_like(input_ids, baseline_token_id))      # [1, L, D]
 
-        # Paper Eq. 2: alpha_j = j / J, j=1..J.
-        alphas = (
-            torch.arange(1, steps + 1, device=self.input_device, dtype=input_embeddings.dtype)
-            .div(steps)
-            .view(steps, 1, 1)
-        )
+        # Match new_nothingnew_2/SegmentSelectiveSFT exactly: J evenly spaced
+        # interpolation points including both 0 and 1.
+        alphas = torch.linspace(
+            0,
+            1,
+            steps,
+            device=self.input_device,
+            dtype=input_embeddings.dtype,
+        ).view(steps, 1, 1)
         total_gradients = torch.zeros_like(input_embeddings)  # [1, L, D]
 
         ans_start, ans_end = answer_indices
@@ -182,10 +186,18 @@ def parse_args():
     p.add_argument("--input_data", type=str, required=True, help="Path to input jsonl")
     p.add_argument("--output_data_file", type=str, required=True, help="Path to attributed JSONL")
     p.add_argument("--output_ig_file", type=str, required=True, help="Path to output IG jsonl")
-    p.add_argument("--ig_steps", type=int, default=50, help="Number of IG steps (paper default: 50)")
+    p.add_argument(
+        "--output_compact_file",
+        type=str,
+        default="",
+        help="Compact per-segment IG summary used by the comparison pipeline",
+    )
+    p.add_argument("--ig_steps", type=int, default=20, help="Number of IG steps")
     p.add_argument("--ig_batch_size", type=int, default=1, help="Interpolation points per forward pass")
     p.add_argument(
+        "--no_gradient_checkpointing",
         "--no-gradient-checkpointing",
+        dest="no_gradient_checkpointing",
         action="store_true",
         help="Use more memory but avoid activation recomputation",
     )
@@ -341,44 +353,44 @@ if __name__ == "__main__":
 
             answer_string = "</think> So, the final answer is \\boxed{" + each_data['answer'] + "}"
             
-            marker = answer_string.rfind("\\boxed")
-            opening = answer_string.find("{", marker)
-            if marker < 0 or opening < 0:
-                raise ValueError(f"Could not locate boxed answer for sample {n}")
-            depth = 0
-            closing = None
-            for char_index in range(opening, len(answer_string)):
-                if answer_string[char_index] == "{":
-                    depth += 1
-                elif answer_string[char_index] == "}":
-                    depth -= 1
-                    if depth == 0:
-                        closing = char_index
-                        break
-            if closing is None or closing <= opening + 1:
-                raise ValueError(f"Could not locate boxed answer content for sample {n}")
-
-            encoded_answer = attribution_calculator.tokenizer(
-                answer_string,
-                add_special_tokens=False,
-                return_offsets_mapping=True,
+            # Preserve the comparison folder's token-level boxed-answer span
+            # heuristic so attribution selects the same target tokens.
+            answer_tokens = attribution_calculator.tokenizer(
+                answer_string, add_special_tokens=False
+            )["input_ids"]
+            answer_tokens_split = attribution_calculator.tokenizer.convert_ids_to_tokens(
+                answer_tokens
             )
-            answer_tokens = encoded_answer["input_ids"]
-            answer_token_indices = [
-                token_index
-                for token_index, (char_start, char_end) in enumerate(
-                    encoded_answer["offset_mapping"]
-                )
-                if char_end > opening + 1 and char_start < closing
-            ]
-            if not answer_token_indices:
-                raise ValueError(f"Boxed answer has no target tokens for sample {n}")
-            ans_start = answer_token_indices[0]
-            ans_end = answer_token_indices[-1] + 1
+            ans_start = None
+            for token_index, token in enumerate(answer_tokens_split):
+                if "boxed" in token:
+                    ans_start = token_index + 1
+            if ans_start is None or "{" not in answer_tokens_split[ans_start]:
+                raise ValueError(f"Could not locate boxed answer for sample {n}")
+            ans_end = len(answer_tokens_split)
+            is_end = False
+            stack = 0
+            for token_index in range(ans_start, len(answer_tokens_split)):
+                token = answer_tokens_split[token_index]
+                if "{" in token or "}" in token:
+                    for character in token:
+                        if character == "{":
+                            stack += 1
+                        elif character == "}":
+                            stack -= 1
+                            if stack == 0:
+                                ans_end = token_index
+                                is_end = True
+                                break
+                    if is_end:
+                        break
             
             full_tokens = user_tokens + assistant_tokens + answer_tokens
             answer_offset = len(user_tokens) + len(assistant_tokens)
-            answer_indices = (ans_start + answer_offset, ans_end + answer_offset)
+            answer_indices = (
+                ans_start + 1 + answer_offset,
+                ans_end + answer_offset,
+            )
 
             importance_scores = attribution_calculator.batch_compute_step_to_answer_attribution_integrated(
                 full_tokens,
@@ -395,19 +407,33 @@ if __name__ == "__main__":
             f.flush()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_ig_file)), exist_ok=True)
+    compact_path = args.output_compact_file
+    if not compact_path:
+        base = args.output_ig_file
+        compact_path = (base[:-6] if base.endswith(".jsonl") else base) + "_compact.jsonl"
+    os.makedirs(os.path.dirname(os.path.abspath(compact_path)), exist_ok=True)
     row_count = 0
     with open(args.output_data_file, encoding="utf-8") as source, open(
         args.output_ig_file, "w", encoding="utf-8"
-    ) as destination:
+    ) as destination, open(compact_path, "w", encoding="utf-8") as compact_output:
         for line in source:
             if not line.strip():
                 continue
-            destination.write(
-                json.dumps(json.loads(line)["attribution"], ensure_ascii=False) + "\n"
-            )
+            attribution = json.loads(line)["attribution"]
+            destination.write(json.dumps(attribution, ensure_ascii=False) + "\n")
+            compact = []
+            for segment in attribution:
+                token_count = len(segment)
+                sum_abs = float(np.sum(np.abs(segment))) if token_count else 0.0
+                sum_signed = float(np.sum(segment)) if token_count else 0.0
+                compact.append(
+                    [token_count, round(sum_abs, 8), round(sum_signed, 8)]
+                )
+            compact_output.write(json.dumps({"segments": compact}) + "\n")
             row_count += 1
     if row_count != len(input_data):
         raise RuntimeError(
             f"Attributed row count mismatch: wrote {row_count}, expected {len(input_data)}"
         )
     print(f"Wrote {row_count} attribution rows to {args.output_ig_file}")
+    print(f"Wrote compact attribution rows to {compact_path}")

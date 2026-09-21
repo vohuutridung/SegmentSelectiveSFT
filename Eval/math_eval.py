@@ -140,7 +140,6 @@ def setup(args):
             tensor_parallel_size=len(available_gpus) // args.pipeline_parallel_size,
             pipeline_parallel_size=args.pipeline_parallel_size,
             trust_remote_code=True,
-            seed=args.seed,
             gpu_memory_utilization=args.gpu_memory_utilization,
             enable_prefix_caching=args.enable_prefix_caching,
         )
@@ -346,7 +345,8 @@ def main(llm, tokenizer, data_name, args):
         # get all outputs
         prompts = [item[1] for item in current_prompts]
         if args.use_vllm:
-            sampling_params = [
+            outputs = llm.generate(
+                prompts,
                 SamplingParams(
                     temperature=args.temperature,
                     top_p=args.top_p,
@@ -355,16 +355,9 @@ def main(llm, tokenizer, data_name, args):
                     repetition_penalty=args.repetition_penalty,
                     max_tokens=args.max_tokens_per_call,
                     n=1,
-                    # Repeated prompts must use independent, reproducible streams.
-                    seed=args.seed + request_index + epoch * len(input_prompts),
                     stop=stop_words,
                     stop_token_ids=args.stop_token_ids or None,
-                )
-                for request_index, _ in current_prompts
-            ]
-            outputs = llm.generate(
-                prompts,
-                sampling_params,
+                ),
             )
 
             outputs = sorted(
